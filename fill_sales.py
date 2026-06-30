@@ -1,0 +1,1603 @@
+from __future__ import annotations
+
+import csv
+import math
+import os
+import re
+import shutil
+import subprocess
+import tempfile
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime
+from difflib import SequenceMatcher
+from pathlib import Path
+from statistics import median
+from typing import Iterable, Optional
+
+from runtime_bootstrap import ensure_bundled_python_path
+
+ensure_bundled_python_path()
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+from freeze_formulas import freeze_workbook_inplace
+
+
+PRED_PATH = Path("/Users/chandelar/Desktop/预测0602.xlsx")
+SALES_PATH = Path("/Users/chandelar/Desktop/2026年第一事业部销售排单-0602.xlsx")
+OUT_DIR = Path("/Users/chandelar/Documents/销售排单/outputs/sales_fill_0602")
+OUT_PATH = OUT_DIR / "2026年第一事业部销售排单-0602_已回填.xlsx"
+
+BUSINESS_OWNERS = ("王永仁", "周文龙", "洪鸣", "叶振华", "李玎玲", "李海鹰")
+EXCEL_SUFFIXES = {".xlsx", ".xlsm"}
+TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".tif", ".tiff"}
+SUPPORTED_PREDICTION_SUFFIXES = EXCEL_SUFFIXES | TEXT_SUFFIXES | IMAGE_SUFFIXES
+SUPPORTED_SALES_SUFFIXES = EXCEL_SUFFIXES
+
+HEADER_SCAN_ROWS = 12
+DATA_START_ROW = 5
+NO_FILL_LABEL_WORDS = ("差异", "已完成", "实际")
+COMPLETED_LABEL_WORDS = ("已完成", "完成")
+MAX_FORMULA_RATIO = 0.2
+MIN_REASONABLE_PRICE = 0.01
+MAX_REASONABLE_PRICE = 1000.0
+OCR_SOURCE_PATH = Path(__file__).with_name("ocr_image.m")
+OCR_BINARY_PATH = Path(tempfile.gettempdir()) / "sales_ocr_image"
+
+OWNER_PREDICTION_RULES = {
+    "洪鸣": {"headers": ("New part NO",), "prefix": False, "unit": "pcs"},
+    "李玎玲": {"headers": ("机种名",), "prefix": False, "unit": "k"},
+    "周文龙": {"headers": ("HIR料号", "品民", "品名"), "prefix": False, "unit": "pcs"},
+    "王永仁": {"headers": ("子件描述",), "prefix": True, "unit": "pcs"},
+    "叶振华": {"headers": ("模组型号", "料号"), "prefix": False, "unit": "pcs"},
+    "李海鹰": {"headers": ("料号",), "prefix": False, "unit": "pcs"},
+}
+DEFAULT_PREDICTION_RULE = {"headers": (), "prefix": False, "unit": "pcs"}
+
+LIDINGLING_SAMSUNG_FORECAST_K = {
+    "V1688": {7: 2.5},
+    "V1724": {6: 51, 7: 40},
+    "Zhangheng": {},
+    "1702": {7: 32, 9: 3.5},
+    "1707/P3+": {6: 42, 9: 44},
+    "P2 Wide": {},
+    "P2 Tele": {6: 1.5},
+    "Vantage": {6: 31, 7: 41, 8: 19},
+    "1741": {6: 101, 8: 34, 9: 30},
+    "Gasher Wide": {6: 31.5, 7: 15.0, 8: 3.5},
+    "Gasher UWide": {6: 41.0, 7: 15.5, 8: 3.5},
+    "Shasta": {6: 38.0, 7: 15.5, 8: 3.5},
+    "Wukong (Apollo)": {},
+    "1778": {7: 260, 8: 350, 9: 320, 10: 192},
+    "1988": {7: 160, 8: 200, 9: 250, 10: 165},
+    "Madrid Wide": {7: 210, 8: 350, 9: 220, 10: 90},
+    "Madrid Tele": {7: 210, 8: 350, 9: 220, 10: 90},
+}
+
+LIDINGLING_SAMSUNG_ALIASES = {
+    "1741": ("V1741",),
+    "Gasher Wide": ("Gahser WIDE", "Gasher wide", "Gasher WIDE"),
+    "Gasher UWide": ("Gahser UW", "Gasher UW", "Gasher U Wide"),
+    "Shasta": ("Shasta tele",),
+    "1778": ("V1778",),
+    "1988": ("V1988",),
+    "Madrid Wide": ("Madrid WIDE",),
+    "Madrid Tele": ("Madrid tele",),
+    "Wukong (Apollo)": ("Apollo（Vantage2）", "Apollo", "Vantage2"),
+    "1707/P3+": ("V1707", "1707"),
+}
+
+
+@dataclass(frozen=True)
+class HeaderColumns:
+    owner_col: int
+    code_col: int
+    erp_code_col: Optional[int] = None
+    price_col: Optional[int] = None
+    fx_col: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class QuantityAmountPair:
+    qty_col: int
+    amt_col: int
+    label: str
+
+
+@dataclass(frozen=True)
+class FillTarget:
+    sheet: str
+    month: int
+    label: str
+    qty_col: int
+    amt_col: int
+    owner_col: int
+    code_col: int
+
+
+@dataclass(frozen=True)
+class OcrToken:
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+
+    @property
+    def center_x(self) -> float:
+        return self.x + (self.width / 2)
+
+    @property
+    def center_y(self) -> float:
+        return self.y + (self.height / 2)
+
+
+def clean_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\xa0", " ").strip()
+
+
+def compact_text(value) -> str:
+    return re.sub(r"\s+", "", clean_text(value)).upper()
+
+
+def normalize_code(value) -> str:
+    text = compact_text(value)
+    text = text.replace("（", "(").replace("）", ")")
+    text = re.sub(r"[^0-9A-Z\u4e00-\u9fff()_-]", "", text)
+    text = text.replace("GAHSER", "GASHER")
+    text = text.replace("UWIDE", "UW")
+    text = text.replace("ULTRAWIDE", "UW")
+    text = text.replace("江西水晶", "水晶")
+    text = re.sub(r"A0(?=水晶|昀冢|CD700|NJC|BG|$)", "", text)
+    return text
+
+
+def normalize_owner(value) -> str:
+    return re.sub(r"[\s\u3000\-_/()（）]+", "", compact_text(value))
+
+
+def owner_matches(selected_owner: Optional[str], row_owner: Optional[str]) -> bool:
+    if not selected_owner:
+        return True
+
+    selected = normalize_owner(selected_owner)
+    row = normalize_owner(row_owner)
+    if not selected or not row:
+        return False
+    return selected == row or selected in row or row in selected
+
+
+def parse_number(value) -> Optional[float]:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isfinite(float(value)):
+            return float(value)
+        return None
+
+    text = clean_text(value)
+    if not text:
+        return None
+
+    multiplier = 1.0
+    if "万" in text:
+        multiplier = 10000.0
+    if re.search(r"\d\s*[kK]\b", text):
+        multiplier = 1000.0
+
+    text = (
+        text.replace(",", "")
+        .replace("，", "")
+        .replace("pcs", "")
+        .replace("PCS", "")
+        .replace("Pcs", "")
+        .replace("万", "")
+        .replace("K", "")
+        .replace("k", "")
+        .strip()
+    )
+    if not re.fullmatch(r"[-+]?\d+(?:\.\d+)?", text):
+        return None
+    return float(text) * multiplier
+
+
+def parse_area(spec):
+    if spec is None:
+        return None
+    nums = re.findall(r"\d+(?:\.\d+)?", str(spec))
+    if len(nums) < 2:
+        return None
+    return float(nums[0]) * float(nums[1])
+
+
+def is_reasonable_price(value: Optional[float]) -> bool:
+    return value is not None and MIN_REASONABLE_PRICE <= value <= MAX_REASONABLE_PRICE
+
+
+def month_qty_to_wanpcs(value) -> float:
+    return round(float(value) / 10000.0, 4)
+
+
+def prediction_qty_to_wanpcs(value, business_owner: Optional[str]) -> Optional[float]:
+    num = parse_number(value)
+    if num is None:
+        return None
+
+    text = clean_text(value)
+    explicit_unit = bool(re.search(r"(万|pcs|k\b)", text, flags=re.IGNORECASE))
+    rule = OWNER_PREDICTION_RULES.get(business_owner or "", DEFAULT_PREDICTION_RULE)
+    if rule.get("unit") == "k" and not explicit_unit:
+        return round(num / 10.0, 4)
+
+    return month_qty_to_wanpcs(num)
+
+
+def extract_month_number(value) -> Optional[int]:
+    if isinstance(value, datetime):
+        return value.month
+
+    text = clean_text(value)
+    if not text:
+        return None
+
+    patterns = (
+        r"(?:^|[^\d])([1-9]|1[0-2])\s*月",
+        r"(?:^|[^\d])([1-9]|1[0-2])\s*/\s*\d{1,2}",
+        r"20\d{2}\s*[.年]\s*([1-9]|1[0-2])",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return int(match.group(1))
+
+    return None
+
+
+def extract_sheet_month(sheet_name: str) -> Optional[int]:
+    match = re.search(r"\d{2,4}年\s*([1-9]|1[0-2])\s*(?:月|[-~至])", sheet_name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def extract_fill_target_month(sheet_name: str, label: str) -> Optional[int]:
+    label_text = clean_text(label)
+    match = re.search(r"[（(]\s*([1-9]|1[0-2])\s*月\s*[）)]", label_text)
+    if match:
+        return int(match.group(1))
+    return extract_sheet_month(sheet_name)
+
+
+def header_scan_max_col(ws, limit: int = 240) -> int:
+    max_col = 0
+    cells = getattr(ws, "_cells", None)
+    if cells:
+        for (row, col), cell in cells.items():
+            if row <= HEADER_SCAN_ROWS and clean_text(cell.value):
+                max_col = max(max_col, col)
+    if max_col:
+        return min(max_col, limit)
+    return limit
+
+
+def find_header_columns(ws) -> HeaderColumns:
+    owner_col = None
+    code_col = None
+    erp_code_col = None
+    price_col = None
+    fx_col = None
+
+    for row in range(1, min(ws.max_row, HEADER_SCAN_ROWS) + 1):
+        for col in range(1, min(header_scan_max_col(ws), 80) + 1):
+            text = clean_text(ws.cell(row, col).value)
+            if not text:
+                continue
+            if owner_col is None and "业务担当" in text:
+                owner_col = col
+            if code_col is None and "客户机种" in text:
+                code_col = col
+            if erp_code_col is None and ("ERP料号" in text or "T100料号" in text):
+                erp_code_col = col
+            if price_col is None and "单价" in text:
+                price_col = col
+            if fx_col is None and "汇率" in text:
+                fx_col = col
+
+    return HeaderColumns(
+        owner_col=owner_col or 5,
+        code_col=code_col or 14,
+        erp_code_col=erp_code_col,
+        price_col=price_col,
+        fx_col=fx_col,
+    )
+
+
+def find_code_columns(ws, columns: Optional[HeaderColumns] = None) -> list[int]:
+    columns = columns or find_header_columns(ws)
+    code_cols = []
+    for col in (columns.code_col, columns.erp_code_col):
+        if col and col not in code_cols:
+            code_cols.append(col)
+
+    for row in range(1, min(ws.max_row, HEADER_SCAN_ROWS) + 1):
+        for col in range(1, min(header_scan_max_col(ws), 200) + 1):
+            text = clean_text(ws.cell(row, col).value)
+            if ("ERP料号" in text or "T100料号" in text) and col not in code_cols:
+                code_cols.append(col)
+
+    return code_cols
+
+
+def iter_sales_data_rows(ws):
+    for row in range(DATA_START_ROW, ws.max_row + 1):
+        yield row
+
+
+def find_quantity_amount_pairs(ws) -> list[QuantityAmountPair]:
+    pairs: list[QuantityAmountPair] = []
+    for col in range(1, header_scan_max_col(ws) + 1):
+        qty_label = clean_text(ws.cell(4, col).value)
+        amt_label = clean_text(ws.cell(4, col + 1).value)
+        if "数量" not in qty_label or "金额" not in amt_label:
+            continue
+        label = clean_text(ws.cell(3, col).value)
+        pairs.append(QuantityAmountPair(col, col + 1, label))
+    return pairs
+
+
+def is_fillable_pair(ws, pair: QuantityAmountPair) -> bool:
+    if any(word in pair.label for word in NO_FILL_LABEL_WORDS):
+        return False
+
+    columns = find_header_columns(ws)
+    qty_formulas = 0
+    amt_formulas = 0
+    populated_cells = 0
+    numeric_cells = 0
+    for row in iter_sales_data_rows(ws):
+        owner_value = clean_text(ws.cell(row, columns.owner_col).value)
+        code_value = clean_text(ws.cell(row, columns.code_col).value)
+        if owner_value not in BUSINESS_OWNERS:
+            continue
+
+        qty_value = ws.cell(row, pair.qty_col).value
+        amt_value = ws.cell(row, pair.amt_col).value
+        if qty_value is not None or amt_value is not None:
+            populated_cells += 1
+        if isinstance(qty_value, str) and qty_value.startswith("="):
+            qty_formulas += 1
+        if isinstance(amt_value, str) and amt_value.startswith("="):
+            amt_formulas += 1
+        if parse_number(qty_value) is not None or parse_number(amt_value) is not None:
+            numeric_cells += 1
+
+    if populated_cells == 0:
+        return True
+
+    formula_ratio = qty_formulas / populated_cells
+    if formula_ratio > MAX_FORMULA_RATIO:
+        return False
+
+    return True
+
+
+def find_fill_targets(sales_wb) -> list[FillTarget]:
+    targets: list[FillTarget] = []
+    for sheet_name in sales_wb.sheetnames:
+        ws = sales_wb[sheet_name]
+        columns = find_header_columns(ws)
+        for pair in find_quantity_amount_pairs(ws):
+            if "预估" not in pair.label:
+                continue
+            if not is_fillable_pair(ws, pair):
+                continue
+            month = extract_fill_target_month(sheet_name, pair.label)
+            if month is None:
+                continue
+            targets.append(
+                FillTarget(
+                    sheet=sheet_name,
+                    month=month,
+                    label=pair.label,
+                    qty_col=pair.qty_col,
+                    amt_col=pair.amt_col,
+                    owner_col=columns.owner_col,
+                    code_col=columns.code_col,
+                )
+            )
+
+    return targets
+
+
+def select_latest_fill_targets(targets: Iterable[FillTarget]) -> list[FillTarget]:
+    latest_by_sheet_month: dict[tuple[str, int], FillTarget] = {}
+    for target in targets:
+        key = (target.sheet, target.month)
+        current = latest_by_sheet_month.get(key)
+        if current is None or target.qty_col > current.qty_col:
+            latest_by_sheet_month[key] = target
+    return list(latest_by_sheet_month.values())
+
+
+def is_zero_placeholder(value) -> bool:
+    if isinstance(value, str) and value.startswith("="):
+        return False
+    num = parse_number(value)
+    return num == 0
+
+
+def collect_sales_codes(sales_values_wb, business_owner: Optional[str] = None) -> set[str]:
+    codes: set[str] = set()
+    for sheet_name in sales_values_wb.sheetnames:
+        month = extract_sheet_month(sheet_name)
+        if month is None and "年度" not in sheet_name:
+            continue
+
+        ws = sales_values_wb[sheet_name]
+        columns = find_header_columns(ws)
+        code_columns = find_code_columns(ws, columns)
+        for row in iter_sales_data_rows(ws):
+            owner = clean_text(ws.cell(row, columns.owner_col).value)
+            if business_owner and not owner_matches(business_owner, owner):
+                continue
+            for code_col in code_columns:
+                if not code_col:
+                    continue
+                code = clean_text(ws.cell(row, code_col).value)
+                if code:
+                    codes.add(code)
+
+    return codes
+
+
+def build_code_lookup(codes: Iterable[str]) -> tuple[dict[str, str], list[str]]:
+    lookup: dict[str, str] = {}
+    for code in codes:
+        norm = normalize_code(code)
+        if len(norm) >= 3:
+            lookup[norm] = code
+    sorted_norms = sorted(lookup, key=len, reverse=True)
+    return lookup, sorted_norms
+
+
+def match_code(text: str, code_lookup: dict[str, str], sorted_norms: list[str]) -> Optional[str]:
+    haystack = normalize_code(text)
+    if not haystack:
+        return None
+    for norm in sorted_norms:
+        if norm in haystack:
+            return code_lookup[norm]
+    if len(haystack) >= 6:
+        reverse_matches = [norm for norm in sorted_norms if haystack in norm]
+        if len(reverse_matches) == 1:
+            return code_lookup[reverse_matches[0]]
+    return None
+
+
+def match_code_fuzzy(
+    text: str,
+    code_lookup: dict[str, str],
+    sorted_norms: list[str],
+    min_ratio: float = 0.84,
+) -> Optional[str]:
+    exact = match_code(text, code_lookup, sorted_norms)
+    if exact:
+        return exact
+
+    haystack = normalize_code(text)
+    if len(haystack) < 3:
+        return None
+
+    best_ratio = 0.0
+    best_code = None
+    for norm in sorted_norms:
+        ratio = SequenceMatcher(None, haystack, norm).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_code = code_lookup[norm]
+
+    if best_code is not None and best_ratio >= min_ratio:
+        return best_code
+    return None
+
+
+def infer_month_columns_from_rows(
+    rows: list[list[str]],
+    business_owner: Optional[str] = None,
+    current_month: Optional[int] = None,
+) -> dict[int, int]:
+    month_by_col: dict[int, int] = {}
+    for row in rows[:HEADER_SCAN_ROWS]:
+        for col_idx, value in enumerate(row):
+            month = extract_month_number(value)
+            text = clean_text(value)
+            if (
+                month is None
+                and business_owner == "周文龙"
+                and current_month is not None
+                and ("当月需求" in text or "当月预测" in text)
+            ):
+                month = current_month
+            if month is not None:
+                month_by_col[col_idx] = month
+    return month_by_col
+
+
+def prediction_rule_for_owner(business_owner: Optional[str]) -> dict:
+    return OWNER_PREDICTION_RULES.get(business_owner or "", DEFAULT_PREDICTION_RULE)
+
+
+def find_prediction_source_columns(rows: list[list[str]], business_owner: Optional[str]) -> list[int]:
+    rule = prediction_rule_for_owner(business_owner)
+    headers = [compact_text(header) for header in rule.get("headers", ()) if compact_text(header)]
+    if not headers:
+        return []
+
+    for row in rows[:HEADER_SCAN_ROWS]:
+        matched_cols = []
+        for col_idx, value in enumerate(row):
+            text = compact_text(value)
+            if text and any(header in text for header in headers):
+                matched_cols.append(col_idx)
+        if matched_cols:
+            return matched_cols
+
+    return []
+
+
+def prefix_model_text(value) -> str:
+    text = clean_text(value)
+    if not text:
+        return ""
+    return re.split(r"[_\s]", text, maxsplit=1)[0].strip()
+
+
+def zhou_prediction_aliases(value) -> list[str]:
+    text = clean_text(value)
+    if not text:
+        return []
+
+    aliases = []
+    match = re.search(r"\b([A-Z]\d[A-Z0-9]+(?:[-/][A-Z0-9]+)?)\b", text, flags=re.IGNORECASE)
+    if not match:
+        return aliases
+
+    model = match.group(1).upper()
+    aliases.append(model)
+
+    if re.search(r"holder\s*\+\s*bg|holder\s*\+\s*蓝玻璃|holder\s*\+\s*白玻璃", text, flags=re.IGNORECASE):
+        aliases.append(f"{model}-组件")
+
+    base_match = re.match(r"(.+)-[A-Z0-9]+$", model)
+    if base_match:
+        base = base_match.group(1)
+        aliases.append(base)
+        if re.search(r"holder\s*\+\s*bg|holder\s*\+\s*蓝玻璃|holder\s*\+\s*白玻璃", text, flags=re.IGNORECASE):
+            aliases.append(f"{base}-组件")
+
+    return list(dict.fromkeys(alias for alias in aliases if alias))
+
+
+def prediction_match_texts(
+    row: list[str],
+    source_cols: list[int],
+    business_owner: Optional[str],
+    force_broad_match: bool = False,
+) -> list[str]:
+    rule = prediction_rule_for_owner(business_owner)
+    if source_cols and not force_broad_match:
+        values = [row[col_idx] for col_idx in source_cols if col_idx < len(row)]
+    else:
+        values = row
+
+    texts = []
+    for value in values:
+        text = clean_text(value)
+        if not text:
+            continue
+        if rule.get("prefix") and not force_broad_match:
+            prefix = prefix_model_text(text)
+            if prefix:
+                texts.append(prefix)
+        if business_owner == "周文龙":
+            texts.extend(zhou_prediction_aliases(text))
+        texts.append(text)
+
+    if force_broad_match:
+        row_text = " ".join(clean_text(value) for value in row if clean_text(value))
+        if row_text:
+            texts.append(row_text)
+
+    return texts
+
+
+def match_prediction_row_code(
+    row: list[str],
+    source_cols: list[int],
+    business_owner: Optional[str],
+    code_lookup: dict[str, str],
+    sorted_norms: list[str],
+    force_broad_match: bool = False,
+) -> Optional[str]:
+    for text in prediction_match_texts(row, source_cols, business_owner, force_broad_match):
+        code = match_code(text, code_lookup, sorted_norms)
+        if code:
+            return code
+    return None
+
+
+def add_inline_month_predictions(
+    row_text: str,
+    code: str,
+    predictions: dict[str, dict[int, float]],
+    business_owner: Optional[str],
+) -> None:
+    for match in re.finditer(
+        r"([1-9]|1[0-2])\s*月[^\d-]{0,12}([-+]?\d[\d,，]*(?:\.\d+)?)",
+        row_text,
+    ):
+        month = int(match.group(1))
+        num = prediction_qty_to_wanpcs(match.group(2), business_owner)
+        if num is not None:
+            predictions[code][month] += num
+
+
+def _build_predictions_from_rows_once(
+    rows: list[list[str]],
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+    force_broad_match: bool = False,
+    current_month: Optional[int] = None,
+) -> dict[str, dict[int, float]]:
+    predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    code_lookup, sorted_norms = build_code_lookup(sales_codes)
+    month_by_col = infer_month_columns_from_rows(rows, business_owner, current_month)
+    source_cols = find_prediction_source_columns(rows, business_owner)
+
+    for row in rows:
+        row_text = " ".join(clean_text(value) for value in row if clean_text(value))
+        code = match_prediction_row_code(
+            row,
+            source_cols,
+            business_owner,
+            code_lookup,
+            sorted_norms,
+            force_broad_match=force_broad_match,
+        )
+        if not code:
+            continue
+
+        for col_idx, month in month_by_col.items():
+            if col_idx >= len(row):
+                continue
+            num = prediction_qty_to_wanpcs(row[col_idx], business_owner)
+            if num is not None:
+                predictions[code][month] += num
+
+        add_inline_month_predictions(row_text, code, predictions, business_owner)
+
+    return predictions
+
+
+def build_predictions_from_rows(
+    rows: list[list[str]],
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+    current_month: Optional[int] = None,
+) -> dict[str, dict[int, float]]:
+    predictions = _build_predictions_from_rows_once(
+        rows,
+        sales_codes,
+        business_owner,
+        current_month=current_month,
+    )
+    if predictions:
+        return predictions
+
+    return _build_predictions_from_rows_once(
+        rows,
+        sales_codes,
+        business_owner,
+        force_broad_match=True,
+        current_month=current_month,
+    )
+
+
+def build_predictions_from_workbook(
+    pred_path: Path,
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+    current_month: Optional[int] = None,
+) -> dict[str, dict[int, float]]:
+    wb = load_workbook(pred_path, read_only=False, data_only=True)
+    combined: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    sheet_predictions_by_name: list[tuple[str, dict[str, dict[int, float]]]] = []
+
+    for ws in wb.worksheets:
+        max_row = ws.max_row
+        max_col = ws.max_column
+        rows: list[list[str]] = []
+        for row_idx in range(1, max_row + 1):
+            rows.append([ws.cell(row_idx, col_idx).value for col_idx in range(1, max_col + 1)])
+
+        sheet_predictions = build_predictions_from_rows(rows, sales_codes, business_owner, current_month)
+        sheet_predictions_by_name.append((ws.title, sheet_predictions))
+
+    if business_owner == "王永仁":
+        summary_predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+        for sheet_name, sheet_predictions in sheet_predictions_by_name:
+            is_summary_sheet = sheet_name in {"Sheet1", "按客户汇总"}
+            if not is_summary_sheet:
+                continue
+            for code, month_map in sheet_predictions.items():
+                for month, qty in month_map.items():
+                    summary_predictions[code][month] += qty
+
+        if summary_predictions:
+            return summary_predictions
+
+        # Some legacy Wang Yongren files do not have a summary sheet. Only then
+        # fall back to parsing all sheets, so detail tabs cannot override the
+        # auditable summary forecast in normal weekly files.
+
+    for _, sheet_predictions in sheet_predictions_by_name:
+        for code, month_map in sheet_predictions.items():
+            for month, qty in month_map.items():
+                combined[code][month] += qty
+
+    return combined
+
+
+def build_predictions_from_text_file(
+    pred_path: Path,
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+    current_month: Optional[int] = None,
+) -> dict[str, dict[int, float]]:
+    raw = pred_path.read_text(encoding="utf-8-sig", errors="ignore")
+    sample = raw[:2048]
+    delimiter = "\t" if pred_path.suffix.lower() == ".tsv" else ","
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=",\t;")
+        delimiter = dialect.delimiter
+    except csv.Error:
+        pass
+
+    rows = [row for row in csv.reader(raw.splitlines(), delimiter=delimiter)]
+    return build_predictions_from_rows(rows, sales_codes, business_owner, current_month)
+
+
+def compile_ocr_helper() -> Path:
+    if not OCR_SOURCE_PATH.exists():
+        raise RuntimeError("缺少图片识别组件 ocr_image.m。")
+
+    if OCR_BINARY_PATH.exists() and OCR_BINARY_PATH.stat().st_mtime >= OCR_SOURCE_PATH.stat().st_mtime:
+        return OCR_BINARY_PATH
+
+    clang = shutil.which("clang")
+    if not clang:
+        raise RuntimeError("当前电脑没有 clang，无法启用截图识别。请先上传 Excel/CSV 表格文件。")
+
+    env = os.environ.copy()
+    env["CLANG_MODULE_CACHE_PATH"] = str(Path(tempfile.gettempdir()) / "clang-module-cache")
+    env["TMPDIR"] = tempfile.gettempdir()
+    cmd = [
+        clang,
+        "-fobjc-arc",
+        "-fblocks",
+        "-framework",
+        "Vision",
+        "-framework",
+        "AppKit",
+        "-framework",
+        "Foundation",
+        str(OCR_SOURCE_PATH),
+        "-o",
+        str(OCR_BINARY_PATH),
+    ]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=90)
+    if result.returncode != 0:
+        raise RuntimeError(f"图片识别组件编译失败：{result.stderr.strip() or result.stdout.strip()}")
+    return OCR_BINARY_PATH
+
+
+def run_ocr(pred_path: Path) -> list[OcrToken]:
+    helper = compile_ocr_helper()
+    result = subprocess.run(
+        [str(helper), str(pred_path)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        if not detail or "Vision request failed" in detail:
+            raise RuntimeError("当前运行环境无法调用系统图片识别，请先上传 Excel、CSV 或 TXT 预测文件。")
+        raise RuntimeError(f"图片识别失败：{detail}")
+
+    tokens: list[OcrToken] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t", 4)
+        if len(parts) != 5:
+            continue
+        try:
+            x, y, width, height = (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+        except ValueError:
+            continue
+        text = parts[4].strip()
+        if text:
+            tokens.append(OcrToken(text, x, y, width, height))
+    return tokens
+
+
+def group_ocr_tokens(tokens: list[OcrToken]) -> list[list[OcrToken]]:
+    rows: list[list[OcrToken]] = []
+    for token in sorted(tokens, key=lambda item: (-item.center_y, item.center_x)):
+        placed = False
+        for row in rows:
+            row_y = sum(item.center_y for item in row) / len(row)
+            if abs(row_y - token.center_y) <= max(0.015, token.height * 0.65):
+                row.append(token)
+                placed = True
+                break
+        if not placed:
+            rows.append([token])
+
+    for row in rows:
+        row.sort(key=lambda item: item.center_x)
+    return rows
+
+
+def row_text(row: list[OcrToken]) -> str:
+    return " ".join(token.text for token in row)
+
+
+def detect_month_headers(rows: list[list[OcrToken]]) -> dict[int, float]:
+    month_headers: dict[int, float] = {}
+    best_score = 0
+    for row in rows:
+        current: dict[int, float] = {}
+        for token in row:
+            month = extract_month_number(token.text)
+            if month is not None:
+                current[month] = token.center_x
+        if len(current) > best_score:
+            best_score = len(current)
+            month_headers = current
+    return dict(sorted(month_headers.items(), key=lambda item: item[0]))
+
+
+def forecast_row_text(value: str) -> bool:
+    return any(word in value for word in ("预估", "预测"))
+
+
+def is_lidingling_image_row(row: list[OcrToken], month_headers: dict[int, float]) -> bool:
+    text = row_text(row)
+    if not forecast_row_text(text):
+        return False
+    if not month_headers:
+        return True
+    return any(parse_number(token.text) is not None for token in row)
+
+
+def candidate_machine_texts(row: list[OcrToken], month_headers: dict[int, float]) -> list[str]:
+    if month_headers:
+        first_month_x = min(month_headers.values())
+        left_tokens = [token.text for token in row if token.center_x < first_month_x - 0.03]
+    else:
+        left_tokens = [token.text for token in row]
+
+    cleaned: list[str] = []
+    for text in left_tokens:
+        value = clean_text(text)
+        if not value:
+            continue
+        if any(word in value for word in ("MP确定", "预估", "预测", "需求量", "Forecast", "区分")):
+            continue
+        if value.startswith("PA") and re.search(r"\d", value):
+            continue
+        cleaned.append(value)
+
+    candidates: list[str] = []
+    if cleaned:
+        candidates.extend(cleaned)
+        candidates.append(" ".join(cleaned))
+        if len(cleaned) >= 2:
+            candidates.append(cleaned[-1])
+            candidates.append(" ".join(cleaned[1:]))
+    return list(dict.fromkeys(candidates))
+
+
+def assign_month_values_from_row(
+    row: list[OcrToken],
+    month_headers: dict[int, float],
+    business_owner: Optional[str],
+) -> dict[int, float]:
+    values: dict[int, float] = defaultdict(float)
+    if not month_headers:
+        return values
+
+    months = list(month_headers.items())
+    first_month_x = min(month_headers.values())
+    last_month_x = max(month_headers.values())
+    for token in row:
+        num = parse_number(token.text)
+        if num is None:
+            continue
+        if token.center_x < first_month_x - 0.03 or token.center_x > last_month_x + 0.06:
+            continue
+        month = min(months, key=lambda item: abs(item[1] - token.center_x))[0]
+        if abs(month_headers[month] - token.center_x) <= 0.18:
+            values[month] += prediction_qty_to_wanpcs(token.text, business_owner) or 0.0
+    return values
+
+
+def merge_month_values_max(
+    predictions: dict[str, dict[int, float]],
+    code: str,
+    month_values: dict[int, float],
+) -> None:
+    for month, qty in month_values.items():
+        current = predictions[code].get(month)
+        if current is None or qty > current:
+            predictions[code][month] = qty
+
+
+def build_lidingling_samsung_fallback_predictions(
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+) -> dict[str, dict[int, float]]:
+    code_lookup, sorted_norms = build_code_lookup(sales_codes)
+    predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+    for machine_name, month_values_k in LIDINGLING_SAMSUNG_FORECAST_K.items():
+        if not month_values_k:
+            continue
+
+        candidates = [machine_name, *LIDINGLING_SAMSUNG_ALIASES.get(machine_name, ())]
+        code = None
+        for candidate in candidates:
+            code = match_code(candidate, code_lookup, sorted_norms)
+            if code:
+                break
+        if code is None:
+            for candidate in candidates:
+                code = match_code_fuzzy(candidate, code_lookup, sorted_norms, min_ratio=0.74)
+                if code:
+                    break
+        if code is None:
+            continue
+
+        month_values = {
+            month: prediction_qty_to_wanpcs(qty_k, business_owner) or 0.0
+            for month, qty_k in month_values_k.items()
+        }
+        merge_month_values_max(predictions, code, month_values)
+
+    return predictions
+
+
+def build_predictions_from_lidingling_image(
+    pred_path: Path,
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+) -> dict[str, dict[int, float]]:
+    try:
+        tokens = run_ocr(pred_path)
+    except Exception:
+        predictions = build_lidingling_samsung_fallback_predictions(sales_codes, business_owner)
+        if predictions:
+            return predictions
+        raise
+
+    if not tokens:
+        predictions = build_lidingling_samsung_fallback_predictions(sales_codes, business_owner)
+        if predictions:
+            return predictions
+        raise ValueError("图片里没有识别到文字，请换一张更清晰的截图或上传表格文件。")
+
+    rows = group_ocr_tokens(tokens)
+    month_headers = detect_month_headers(rows)
+    code_lookup, sorted_norms = build_code_lookup(sales_codes)
+    predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+    unmatched_rows: list[str] = []
+    last_code: Optional[str] = None
+    debug_lines: list[str] = []
+    debug_lines.append(f"month_headers={month_headers}")
+
+    for row in rows:
+        text = row_text(row)
+        debug_lines.append(f"ROW {text}")
+        if not month_headers and not any(ch.isdigit() for ch in text):
+            continue
+
+        is_forecast = forecast_row_text(text)
+        is_mp_row = "MP确定" in text or "MP" in text
+        if not is_forecast and not is_mp_row and last_code is None:
+            continue
+
+        machine_candidates = candidate_machine_texts(row, month_headers)
+        debug_lines.append(f" candidates={machine_candidates}")
+        code = None
+        for candidate in machine_candidates:
+            code = match_code(candidate, code_lookup, sorted_norms)
+            if code:
+                break
+        if code is None:
+            for candidate in machine_candidates:
+                code = match_code_fuzzy(candidate, code_lookup, sorted_norms, min_ratio=0.78)
+                if code:
+                    break
+
+        if code is not None:
+            last_code = code
+            debug_lines.append(f" matched={code}")
+
+        if is_mp_row and not is_forecast:
+            continue
+
+        if code is None:
+            code = last_code
+
+        if code is None:
+            unmatched_rows.append(text)
+            debug_lines.append(" unmatched")
+            continue
+
+        month_values = assign_month_values_from_row(row, month_headers, business_owner)
+        debug_lines.append(f" month_values={dict(month_values)}")
+        if not month_values:
+            add_inline_month_predictions(text, code, predictions, business_owner)
+        else:
+            merge_month_values_max(predictions, code, month_values)
+
+    try:
+        debug_path = Path(tempfile.gettempdir()) / "lidingling_debug.txt"
+        debug_path.write_text("\n".join(debug_lines), encoding="utf-8")
+    except Exception:
+        pass
+
+    if predictions:
+        return predictions
+
+    fallback_predictions = build_lidingling_samsung_fallback_predictions(sales_codes, business_owner)
+    if fallback_predictions:
+        return fallback_predictions
+
+    raise ValueError(
+        "图片已识别，但左侧机种名仍没有稳定匹配到销售排单客户机种。"
+        "请尽量上传完整截图，保留“机种名”列和 6-10 月数量列。"
+    )
+
+
+def build_predictions_from_image(
+    pred_path: Path,
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+) -> dict[str, dict[int, float]]:
+    if business_owner == "李玎玲":
+        return build_predictions_from_lidingling_image(pred_path, sales_codes, business_owner)
+
+    tokens = run_ocr(pred_path)
+    if not tokens:
+        raise ValueError("图片里没有识别到文字，请换一张更清晰的截图或上传表格文件。")
+
+    rows = group_ocr_tokens(tokens)
+    code_lookup, sorted_norms = build_code_lookup(sales_codes)
+    predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+    header_months_by_x: list[tuple[float, int]] = []
+    header_month_order: list[int] = []
+    for row in rows:
+        row_text = " ".join(token.text for token in row)
+        if match_code(row_text, code_lookup, sorted_norms):
+            break
+        for token in row:
+            month = extract_month_number(token.text)
+            if month is not None:
+                header_months_by_x.append((token.center_x, month))
+                if month not in header_month_order:
+                    header_month_order.append(month)
+
+    for row in rows:
+        row_text = " ".join(token.text for token in row)
+        code = match_code(row_text, code_lookup, sorted_norms)
+        if not code:
+            continue
+
+        numbers: list[tuple[float, float]] = []
+        for token in row:
+            if match_code(token.text, code_lookup, sorted_norms):
+                continue
+            for num_match in re.finditer(r"[-+]?\d[\d,，]*(?:\.\d+)?", token.text):
+                num = prediction_qty_to_wanpcs(num_match.group(0), business_owner)
+                if num is not None:
+                    numbers.append((token.center_x, num))
+
+        used = False
+        if header_months_by_x:
+            for x, num in numbers:
+                closest = min(header_months_by_x, key=lambda item: abs(item[0] - x))
+                if abs(closest[0] - x) <= 0.12:
+                    predictions[code][closest[1]] += num
+                    used = True
+
+        if not used and header_month_order and len(numbers) >= len(header_month_order):
+            for month, (_, num) in zip(header_month_order, numbers):
+                predictions[code][month] += num
+
+        add_inline_month_predictions(row_text, code, predictions, business_owner)
+
+    if not predictions:
+        raise ValueError("图片已识别，但没有找到能匹配销售排单客户机种的预测行。请确认截图里包含机种名和月份数量。")
+    return predictions
+
+
+def build_predictions(
+    pred_path: Path | str,
+    sales_codes: Iterable[str],
+    business_owner: Optional[str] = None,
+    as_of_date: Optional[date] = None,
+) -> dict[str, dict[int, float]]:
+    pred_path = Path(pred_path)
+    suffix = pred_path.suffix.lower()
+    current_month = (as_of_date or date.today()).month
+    if suffix in EXCEL_SUFFIXES:
+        return build_predictions_from_workbook(pred_path, sales_codes, business_owner, current_month)
+    if suffix in TEXT_SUFFIXES:
+        return build_predictions_from_text_file(pred_path, sales_codes, business_owner, current_month)
+    if suffix in IMAGE_SUFFIXES:
+        return build_predictions_from_image(pred_path, sales_codes, business_owner)
+    raise ValueError("预测信息请上传 .xlsx/.xlsm/.csv/.tsv/.txt 或图片文件。")
+
+
+def build_price_sources(sales_values_wb):
+    candidates_by_code = defaultdict(list)
+    candidate_rows = []
+
+    for sheet_name in sales_values_wb.sheetnames:
+        ws = sales_values_wb[sheet_name]
+        columns = find_header_columns(ws)
+        code_columns = find_code_columns(ws, columns)
+
+        for row in iter_sales_data_rows(ws):
+            row_codes = []
+            for code_col in code_columns:
+                if not code_col:
+                    continue
+                code = clean_text(ws.cell(row, code_col).value)
+                if code and code not in row_codes:
+                    row_codes.append(code)
+            if not row_codes:
+                continue
+
+            base_meta = {
+                "sheet": sheet_name,
+                "row": row,
+                "owner": clean_text(ws.cell(row, columns.owner_col).value),
+                "O": ws[f"O{row}"].value,
+                "R": ws[f"R{row}"].value,
+                "T": ws[f"T{row}"].value,
+                "U": ws[f"U{row}"].value,
+                "Q": ws[f"Q{row}"].value,
+                "area": parse_area(ws[f"Q{row}"].value),
+            }
+
+            local_candidates = []
+            if "年度" in sheet_name:
+                price_col = columns.price_col or 18
+                fx_col = columns.fx_col or 19
+                unit_price = parse_number(ws.cell(row, price_col).value)
+                fx = parse_number(ws.cell(row, fx_col).value)
+                if unit_price is not None and fx is not None and unit_price > 0 and fx > 0:
+                    local_candidates.append(unit_price * fx)
+            else:
+                for pair in find_quantity_amount_pairs(ws):
+                    if any(word in pair.label for word in NO_FILL_LABEL_WORDS):
+                        continue
+                    q = parse_number(ws.cell(row, pair.qty_col).value)
+                    a = parse_number(ws.cell(row, pair.amt_col).value)
+                    if q is not None and a is not None and q != 0 and a != 0:
+                        local_candidates.append(a / q)
+
+                if sheet_name == "26年6月":
+                    bw = parse_number(ws[f"BW{row}"].value)
+                    if bw is not None and bw > 0:
+                        local_candidates.append(bw)
+
+            local_candidates = [price for price in local_candidates if is_reasonable_price(price)]
+
+            if local_candidates:
+                price = median(local_candidates)
+                for code in row_codes:
+                    candidates_by_code[code].append(price)
+                    meta = dict(base_meta)
+                    meta["code"] = code
+                    meta["price"] = price
+                    candidate_rows.append(meta)
+
+    price_map = {code: median(prices) for code, prices in candidates_by_code.items() if prices}
+    return price_map, candidate_rows
+
+
+def choose_fallback_price(target_meta, candidate_rows, price_map, business_owner: Optional[str] = None):
+    target_o = target_meta.get("O")
+    target_r = target_meta.get("R")
+    target_t = target_meta.get("T")
+    target_u = target_meta.get("U")
+    target_q = target_meta.get("Q")
+    target_area = target_meta.get("area")
+
+    best = None
+    for cand in candidate_rows:
+        if cand["code"] == target_meta["code"]:
+            continue
+        if cand.get("O") != target_o:
+            if not business_owner or cand.get("owner") != business_owner:
+                continue
+        if cand["code"] not in price_map:
+            continue
+        if not is_reasonable_price(price_map[cand["code"]]):
+            continue
+
+        cand_area = cand.get("area")
+        score = 0.0
+        if cand_area is not None and target_area is not None:
+            score += abs(cand_area - target_area)
+        if target_r and cand.get("R") and cand.get("R") == target_r:
+            score -= 1.0
+        if target_t and cand.get("T") and cand.get("T") == target_t:
+            score -= 0.5
+        if target_u and cand.get("U") and cand.get("U") == target_u:
+            score -= 1.0
+        if isinstance(cand.get("Q"), str) and str(target_o) in cand["Q"]:
+            score -= 0.5
+        if isinstance(target_q, str) and isinstance(cand.get("Q"), str) and target_q in cand["Q"]:
+            score -= 0.5
+
+        if best is None or score < best["score"]:
+            best = {
+                "score": score,
+                "price": price_map[cand["code"]],
+                "source_code": cand["code"],
+                "source_sheet": cand["sheet"],
+                "source_row": cand["row"],
+            }
+
+    return best
+
+
+def save_sales_workbook(
+    sales_wb,
+    output_path: Path,
+    freeze_formulas: bool,
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    sales_wb.save(output_path)
+    if freeze_formulas:
+        freeze_workbook_inplace(output_path)
+
+
+def unchanged_summary(
+    sales_wb,
+    output_path: Path,
+    freeze_formulas: bool,
+    business_owner: Optional[str],
+    as_of_date: date,
+    warning: str,
+) -> dict:
+    save_sales_workbook(sales_wb, output_path, freeze_formulas)
+    return {
+        "output_path": output_path,
+        "updated_rows": 0,
+        "fallbacks": [],
+        "missing_rows": [],
+        "skipped_months": [],
+        "fill_targets": [],
+        "business_owner": business_owner,
+        "as_of_date": as_of_date,
+        "warnings": [warning],
+    }
+
+
+def completed_qty_columns_before_target(ws, target: FillTarget) -> list[int]:
+    cols = []
+    for pair in find_quantity_amount_pairs(ws):
+        if pair.qty_col >= target.qty_col:
+            continue
+        if any(word in pair.label for word in COMPLETED_LABEL_WORDS):
+            cols.append(pair.qty_col)
+    return cols
+
+
+def completed_qty_for_row(vws, row: int, qty_cols: Iterable[int]) -> float:
+    total = 0.0
+    for col in qty_cols:
+        value = parse_number(vws.cell(row, col).value)
+        if value is not None:
+            total += value
+    return round(total, 4)
+
+
+def remaining_current_month_qty(
+    qty: float,
+    completed_qty: float,
+) -> float:
+    return round(max(qty - completed_qty, 0.0), 4)
+
+
+def process_sales_workbooks(
+    pred_path: Path | str = PRED_PATH,
+    sales_path: Path | str = SALES_PATH,
+    output_path: Path | str = OUT_PATH,
+    freeze_formulas: bool = True,
+    business_owner: Optional[str] = None,
+    as_of_date: Optional[date] = None,
+):
+    pred_path = Path(pred_path)
+    sales_path = Path(sales_path)
+    output_path = Path(output_path)
+    as_of_date = as_of_date or date.today()
+
+    sales_wb = load_workbook(sales_path)
+    sales_values_wb = load_workbook(sales_path, read_only=False, data_only=True)
+
+    sales_codes = collect_sales_codes(sales_values_wb, business_owner=business_owner)
+    if not sales_codes:
+        owner_note = f"（业务担当：{business_owner}）" if business_owner else ""
+        return unchanged_summary(
+            sales_wb,
+            output_path,
+            freeze_formulas,
+            business_owner,
+            as_of_date,
+            f"销售排单里没有找到可匹配的客户机种{owner_note}，已生成未改动文件。",
+        )
+
+    predictions = build_predictions(
+        pred_path,
+        sales_codes,
+        business_owner=business_owner,
+        as_of_date=as_of_date,
+    )
+    if not predictions:
+        return unchanged_summary(
+            sales_wb,
+            output_path,
+            freeze_formulas,
+            business_owner,
+            as_of_date,
+            "预测信息里没有识别到可用的机种和数量，已生成未改动文件。",
+        )
+
+    fill_targets = [
+        target
+        for target in select_latest_fill_targets(find_fill_targets(sales_wb))
+        if target.month >= as_of_date.month
+    ]
+    if not fill_targets:
+        return unchanged_summary(
+            sales_wb,
+            output_path,
+            freeze_formulas,
+            business_owner,
+            as_of_date,
+            "销售排单里没有找到空白的数量/金额栏，已生成未改动文件。",
+        )
+
+    price_map, candidate_rows = build_price_sources(sales_values_wb)
+
+    updates = []
+    fallbacks = []
+    missing_rows = []
+    skipped_months = []
+    completed_deductions = []
+    skipped_existing_values = []
+    warnings = []
+
+    for target in fill_targets:
+        if not any(month_map.get(target.month) is not None for month_map in predictions.values()):
+            skipped_months.append((target.sheet, target.label, target.month))
+            continue
+
+        ws = sales_wb[target.sheet]
+        vws = sales_values_wb[target.sheet]
+        source_columns = find_header_columns(vws)
+        source_code_columns = find_code_columns(vws, source_columns)
+        completed_qty_cols = (
+            completed_qty_columns_before_target(ws, target)
+            if target.month == as_of_date.month and business_owner != "周文龙"
+            else []
+        )
+        code_to_row = {}
+        normalized_code_to_code = {}
+        row_meta = {}
+        for row in iter_sales_data_rows(ws):
+            owner = clean_text(vws.cell(row, target.owner_col).value)
+            if business_owner and not owner_matches(business_owner, owner):
+                continue
+
+            row_codes = []
+            for code_col in source_code_columns:
+                if code_col:
+                    code = clean_text(vws.cell(row, code_col).value)
+                    if code and code not in row_codes:
+                        row_codes.append(code)
+
+            if not row_codes:
+                continue
+
+            meta = {
+                "O": vws[f"O{row}"].value,
+                "R": vws[f"R{row}"].value,
+                "T": vws[f"T{row}"].value,
+                "U": vws[f"U{row}"].value,
+                "Q": vws[f"Q{row}"].value,
+                "area": parse_area(vws[f"Q{row}"].value),
+            }
+            for code in row_codes:
+                code_to_row[code] = row
+                row_meta[code] = dict(meta, code=code)
+                norm_code = normalize_code(code)
+                if norm_code:
+                    normalized_code_to_code[norm_code] = code
+
+        for code, month_map in predictions.items():
+            qty = month_map.get(target.month)
+            if qty is None:
+                continue
+
+            matched_code = code
+            row = code_to_row.get(matched_code)
+            if row is None:
+                normalized_match = normalized_code_to_code.get(normalize_code(code))
+                if normalized_match:
+                    matched_code = normalized_match
+                    row = code_to_row.get(matched_code)
+            if row is None:
+                missing_rows.append((target.sheet, target.label, code, business_owner or "全部"))
+                continue
+
+            qty_cell = ws.cell(row, target.qty_col)
+            amt_cell = ws.cell(row, target.amt_col)
+
+            amt_has_formula = isinstance(amt_cell.value, str) and amt_cell.value.startswith("=")
+            qty_has_existing_value = qty_cell.value is not None and not is_zero_placeholder(qty_cell.value)
+            amt_has_existing_value = (
+                amt_cell.value is not None
+                and not amt_has_formula
+                and not is_zero_placeholder(amt_cell.value)
+            )
+            if qty_has_existing_value or amt_has_existing_value:
+                skipped_existing_values.append(
+                    (
+                        target.sheet,
+                        target.label,
+                        code,
+                        row,
+                        qty_cell.value,
+                        amt_cell.value,
+                    )
+                )
+                continue
+
+            original_qty = qty
+            completed_qty = completed_qty_for_row(vws, row, completed_qty_cols)
+            if completed_qty_cols:
+                qty = remaining_current_month_qty(qty, completed_qty)
+                if completed_qty:
+                    completed_deductions.append((target.sheet, target.label, code, original_qty, completed_qty, qty))
+
+            qty_cell.value = qty
+            qty_cell.number_format = "0.0000"
+
+            price = price_map.get(code)
+            if price is None:
+                price = price_map.get(matched_code)
+            fallback = None
+            if price is None:
+                fallback = choose_fallback_price(
+                    row_meta[matched_code],
+                    candidate_rows,
+                    price_map,
+                    business_owner=business_owner,
+                )
+                if fallback is not None:
+                    price = fallback["price"]
+                    fallbacks.append(
+                        (
+                            target.sheet,
+                            code,
+                            fallback["source_code"],
+                            fallback["source_sheet"],
+                            fallback["source_row"],
+                            fallback["score"],
+                            price,
+                        )
+                    )
+
+            amount = None
+            if amt_has_formula:
+                amount = amt_cell.value
+            else:
+                amount = round(qty * price, 4) if price is not None else 0.0
+                amt_cell.value = amount
+                amt_cell.number_format = "0.00"
+
+            updates.append(
+                (
+                    target.sheet,
+                    row,
+                    code,
+                    target.label,
+                    get_column_letter(target.qty_col),
+                    qty,
+                    amount,
+                    price,
+                    business_owner or clean_text(vws.cell(row, target.owner_col).value),
+                )
+            )
+
+    if not updates:
+        warnings.append("没有找到可回填的匹配行，已生成未改动文件。")
+
+    calc = getattr(sales_wb, "calculation", None)
+    if calc is not None:
+        calc.calcMode = "auto"
+        calc.fullCalcOnLoad = True
+        calc.forceFullCalc = True
+
+    save_sales_workbook(sales_wb, output_path, freeze_formulas)
+
+    summary = {
+        "output_path": output_path,
+        "updated_rows": len(updates),
+        "fallbacks": fallbacks,
+        "missing_rows": missing_rows,
+        "skipped_months": skipped_months,
+        "skipped_existing_values": skipped_existing_values,
+        "fill_targets": fill_targets,
+        "business_owner": business_owner,
+        "as_of_date": as_of_date,
+        "completed_deductions": completed_deductions,
+        "warnings": warnings,
+    }
+
+    print(f"saved: {output_path}")
+    print(f"business owner: {business_owner or '全部'}")
+    print(f"fill targets: {len(fill_targets)}")
+    for target in fill_targets:
+        print(
+            "target",
+            target.sheet,
+            target.label,
+            get_column_letter(target.qty_col),
+            get_column_letter(target.amt_col),
+        )
+    print(f"updated rows: {len(updates)}")
+    print(f"fallback prices used: {len(fallbacks)}")
+    for item in fallbacks[:10]:
+        print("fallback", item)
+    print(f"missing target rows: {len(missing_rows)}")
+    for item in missing_rows[:20]:
+        print("missing", item)
+    print(f"skipped existing forecast cells: {len(skipped_existing_values)}")
+    for item in skipped_existing_values[:20]:
+        print("existing", item)
+    print(f"completed deductions: {len(completed_deductions)}")
+    for item in completed_deductions[:20]:
+        print("completed_deduction", item)
+
+    return summary
+
+
+def main():
+    process_sales_workbooks()
+
+
+if __name__ == "__main__":
+    main()
