@@ -35,7 +35,18 @@ MASTER_SALES_PATH = DATA_DIR / "current_sales.xlsx"
 LATEST_OUTPUT_PATH = DATA_DIR / "latest_generated.xlsx"
 METADATA_PATH = DATA_DIR / "metadata.json"
 BACKUP_DIR = DATA_DIR / "backups"
+UPLOAD_DIR = DATA_DIR / "uploads"
 STATE_LOCK = threading.Lock()
+JOB_LOCK = threading.Lock()
+JOB_STATUS = {
+    "state": "idle",
+    "owner": "",
+    "message": "",
+    "started_at": "",
+    "finished_at": "",
+    "updated_rows": "",
+    "error": "",
+}
 OWNER_GUIDES = {
     "洪鸣": "读取预测文件中的 New part NO 匹配销售排单“客户机种”。",
     "李玎玲": "优先识别截图里的“机种名”和 6-10 月预测数量，自动匹配销售排单“客户机种”；数量单位 K 会自动换算成万 pcs。",
@@ -135,6 +146,7 @@ def owner_link(owner: str) -> str:
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_metadata() -> dict:
@@ -149,6 +161,20 @@ def load_metadata() -> dict:
 def save_metadata(metadata: dict) -> None:
     ensure_data_dir()
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_job_status() -> dict:
+    with JOB_LOCK:
+        return dict(JOB_STATUS)
+
+
+def set_job_status(**values) -> None:
+    with JOB_LOCK:
+        JOB_STATUS.update(values)
+
+
+def job_is_running() -> bool:
+    return get_job_status().get("state") == "running"
 
 
 def now_label() -> str:
@@ -243,6 +269,26 @@ def render_page(
     if latest_file and has_master:
         detail_parts.append(f"下载文件名：{latest_file}")
     detail_text = " ｜ ".join(detail_parts) if detail_parts else "共用排单会在每位业务上传预测后自动保存为最新版。"
+    job = get_job_status()
+    job_state = job.get("state", "idle")
+    if job_state == "running":
+        job_html = (
+            f'<div class="notice working" role="status">正在处理：{html.escape(job.get("owner", ""))} 的预测，'
+            f'开始时间：{html.escape(job.get("started_at", ""))}。处理完成前请不要重复上传。</div>'
+        )
+    elif job_state == "done":
+        job_html = (
+            f'<div class="notice success" role="status">最近处理完成：{html.escape(job.get("owner", ""))}，'
+            f'更新 {html.escape(str(job.get("updated_rows", "")))} 行，'
+            f'{html.escape(job.get("finished_at", ""))}。可以下载当前最新版。</div>'
+        )
+    elif job_state == "error":
+        job_html = (
+            f'<div class="notice error" role="alert">最近处理失败：{html.escape(job.get("owner", ""))}，'
+            f'{html.escape(job.get("error", ""))}</div>'
+        )
+    else:
+        job_html = ""
 
     page = f"""<!doctype html>
 <html lang="zh-CN">
@@ -403,6 +449,11 @@ def render_page(
       background: #e8f5ee;
       border-color: #bbdec9;
       color: var(--success);
+    }}
+    .notice.working {{
+      background: #fff8e6;
+      border-color: #efd596;
+      color: var(--warn);
     }}
     .notice.error {{
       background: #fff0ee;
@@ -618,6 +669,7 @@ def render_page(
         </div>
         {message_html}
         {error_html}
+        {job_html}
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
@@ -636,8 +688,9 @@ def render_page(
             <div class="hint">支持 Excel、CSV、TXT；截图入口已接入，系统 OCR 可用时会自动识别。无需再上传销售排单。</div>
           </div>
           <div class="actions">
-            <button class="primary" type="submit">生成回填文件</button>
+            <button class="primary" type="submit">开始回填</button>
             <a class="secondary button" href="{owner_link(selected_owner)}">重置当前页面</a>
+            {download_latest_html}
           </div>
         </form>
       </section>
@@ -783,6 +836,80 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
         )
 
 
+def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
+    set_job_status(
+        state="running",
+        owner=selected_owner,
+        message="正在回填共用销售排单",
+        started_at=now_label(),
+        finished_at="",
+        updated_rows="",
+        error="",
+    )
+    try:
+        with tempfile.TemporaryDirectory(prefix="sales_job_") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            working_sales_path = tmp_path / "current_sales.xlsx"
+            output_path = tmp_path / "generated.xlsx"
+
+            with STATE_LOCK:
+                if not master_sales_exists():
+                    raise ValueError("共用销售排单不存在，请先重新上传本周排单。")
+                ensure_data_dir()
+                shutil.copy2(MASTER_SALES_PATH, working_sales_path)
+
+            summary = process_sales_workbooks(
+                pred_path=pred_path,
+                sales_path=working_sales_path,
+                output_path=output_path,
+                # The shared weekly schedule can contain hundreds of thousands
+                # of formulas. Freezing them during a web upload makes the
+                # request time out, so the website keeps formulas live.
+                freeze_formulas=False,
+                business_owner=selected_owner,
+            )
+
+            with STATE_LOCK:
+                if not master_sales_exists():
+                    raise ValueError("共用销售排单不存在，请先重新上传本周排单。")
+                backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}_before.xlsx"
+                shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
+                shutil.copy2(output_path, MASTER_SALES_PATH)
+                shutil.copy2(output_path, LATEST_OUTPUT_PATH)
+
+                metadata = load_metadata()
+                master_name = metadata.get("master_name", "销售排单.xlsx")
+                stem = Path(master_name).stem if master_name else "销售排单"
+                download_name = f"{stem}_{selected_owner}_已回填_当前最新版.xlsx"
+                metadata.update(
+                    {
+                        "latest_name": download_name,
+                        "last_owner": selected_owner,
+                        "last_generated_at": now_label(),
+                        "last_updated_rows": summary["updated_rows"],
+                    }
+                )
+                save_metadata(metadata)
+
+        set_job_status(
+            state="done",
+            owner=selected_owner,
+            message="处理完成",
+            finished_at=now_label(),
+            updated_rows=summary["updated_rows"],
+            error="",
+        )
+    except Exception as exc:  # noqa: BLE001
+        set_job_status(
+            state="error",
+            owner=selected_owner,
+            message="处理失败",
+            finished_at=now_label(),
+            updated_rows="",
+            error=str(exc),
+        )
+
+
 def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
     if handler.headers.get_content_type() != UPLOAD_MIME:
         write_html(
@@ -814,61 +941,40 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             raise ValueError("预测信息请上传 Excel、CSV、TXT 或图片文件。")
         if not master_sales_exists():
             raise ValueError("请先在页面上方上传本周共用销售排单。")
+        if job_is_running():
+            raise ValueError("上一份预测还在处理，请稍后刷新页面，完成后再上传下一位业务预测。")
 
-        with tempfile.TemporaryDirectory(prefix="sales_upload_") as tmp_dir:
-            tmp_path = Path(tmp_dir)
-            pred_path = tmp_path / f"prediction{pred_suffix}"
-            output_path = tmp_path / "generated.xlsx"
+        ensure_data_dir()
+        pred_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
+        pred_path = UPLOAD_DIR / pred_name
+        save_upload(pred_field, pred_path)
+        set_job_status(
+            state="running",
+            owner=selected_owner,
+            message="正在回填共用销售排单",
+            started_at=now_label(),
+            finished_at="",
+            updated_rows="",
+            error="",
+        )
 
-            save_upload(pred_field, pred_path)
+        worker = threading.Thread(
+            target=process_prediction_job,
+            args=(selected_owner, pred_path),
+            daemon=True,
+        )
+        worker.start()
 
-            with STATE_LOCK:
-                if not master_sales_exists():
-                    raise ValueError("请先在页面上方上传本周共用销售排单。")
-                ensure_data_dir()
-                working_sales_path = tmp_path / "current_sales.xlsx"
-                shutil.copy2(MASTER_SALES_PATH, working_sales_path)
-                summary = process_sales_workbooks(
-                    pred_path=pred_path,
-                    sales_path=working_sales_path,
-                    output_path=output_path,
-                    freeze_formulas=True,
-                    business_owner=selected_owner,
-                )
-
-                backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}_before.xlsx"
-                shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
-                shutil.copy2(output_path, MASTER_SALES_PATH)
-                shutil.copy2(output_path, LATEST_OUTPUT_PATH)
-
-                metadata = load_metadata()
-                master_name = metadata.get("master_name", "销售排单.xlsx")
-                stem = Path(master_name).stem if master_name else "销售排单"
-                download_name = f"{stem}_{selected_owner}_已回填_当前最新版.xlsx"
-                metadata.update(
-                    {
-                        "latest_name": download_name,
-                        "last_owner": selected_owner,
-                        "last_generated_at": now_label(),
-                        "last_updated_rows": summary["updated_rows"],
-                    }
-                )
-                save_metadata(metadata)
-
-            handler.send_response(200)
-            handler.send_header("Content-Type", XLSX_MIME)
-            handler.send_header("Content-Disposition", content_disposition(download_name))
-            handler.send_header("Content-Length", str(LATEST_OUTPUT_PATH.stat().st_size))
-            handler.send_header("X-Updated-Rows", str(summary["updated_rows"]))
-            if summary.get("warnings"):
-                handler.send_header("X-Warnings", urllib.parse.quote("；".join(summary["warnings"])))
-            if summary.get("missing_rows"):
-                handler.send_header("X-Missing-Rows", str(len(summary["missing_rows"])))
-            handler.send_header("Cache-Control", "no-store")
-            handler.end_headers()
-            if not head:
-                with LATEST_OUTPUT_PATH.open("rb") as f:
-                    shutil.copyfileobj(f, handler.wfile)
+        write_html(
+            handler,
+            202,
+            render_page(
+                message=f"{selected_owner} 的预测已上传，网站正在后台回填。请稍后刷新页面，完成后点击“下载当前最新版”。",
+                handler=handler,
+                selected_owner=selected_owner,
+            ).decode("utf-8"),
+            head=head,
+        )
         return
     except Exception as exc:  # noqa: BLE001
         write_html(
