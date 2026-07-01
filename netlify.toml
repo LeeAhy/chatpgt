@@ -1,0 +1,14 @@
+[build]
+  publish = "netlify-site"
+  command = "npm install"
+  functions = "netlify/functions"
+
+[[redirects]]
+  from = "/owner/*"
+  to = "/index.html"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

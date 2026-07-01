@@ -11,7 +11,9 @@ import socket
 import subprocess
 import tempfile
 import threading
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -41,6 +43,11 @@ LATEST_OUTPUT_PATH = DATA_DIR / "latest_generated.xlsx"
 METADATA_PATH = DATA_DIR / "metadata.json"
 BACKUP_DIR = DATA_DIR / "backups"
 UPLOAD_DIR = DATA_DIR / "uploads"
+REMOTE_STORAGE_ENDPOINT = os.environ.get("NETLIFY_BLOBS_ENDPOINT", "").strip().rstrip("/")
+REMOTE_STORAGE_SECRET = os.environ.get("SALES_STORAGE_SECRET", "").strip()
+REMOTE_MASTER_KEY = "current_sales.xlsx"
+REMOTE_LATEST_KEY = "latest_generated.xlsx"
+REMOTE_METADATA_KEY = "metadata.json"
 STATE_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 JOB_STATUS = {
@@ -160,7 +167,94 @@ def ensure_data_dir() -> None:
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def remote_storage_enabled() -> bool:
+    return bool(REMOTE_STORAGE_ENDPOINT and REMOTE_STORAGE_SECRET)
+
+
+def remote_storage_url(key: str) -> str:
+    return f"{REMOTE_STORAGE_ENDPOINT}?key={urllib.parse.quote(key)}"
+
+
+def remote_request(
+    method: str,
+    key: str,
+    data: bytes | None = None,
+    content_type: str = "application/octet-stream",
+) -> Optional[bytes]:
+    if not remote_storage_enabled():
+        return None
+
+    headers = {"x-sales-storage-secret": REMOTE_STORAGE_SECRET}
+    if data is not None:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(
+        remote_storage_url(key),
+        data=data,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404 and method == "GET":
+            return None
+        raise RuntimeError(f"Netlify Blobs 请求失败：HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"连接 Netlify Blobs 失败：{exc.reason}") from exc
+
+
+def remote_put_file(key: str, path: Path, content_type: str = XLSX_MIME) -> None:
+    if not remote_storage_enabled() or not path.exists():
+        return
+    remote_request("PUT", key, path.read_bytes(), content_type=content_type)
+
+
+def remote_get_file(key: str, path: Path) -> bool:
+    if not remote_storage_enabled():
+        return False
+    data = remote_request("GET", key)
+    if data is None:
+        return False
+    ensure_data_dir()
+    path.write_bytes(data)
+    return True
+
+
+def remote_put_json(key: str, payload: dict) -> None:
+    if not remote_storage_enabled():
+        return
+    remote_request(
+        "PUT",
+        key,
+        json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"),
+        content_type="application/json; charset=utf-8",
+    )
+
+
+def hydrate_remote_state() -> None:
+    if not remote_storage_enabled():
+        return
+    ensure_data_dir()
+    if not METADATA_PATH.exists():
+        remote_get_file(REMOTE_METADATA_KEY, METADATA_PATH)
+    if not MASTER_SALES_PATH.exists():
+        remote_get_file(REMOTE_MASTER_KEY, MASTER_SALES_PATH)
+    if MASTER_SALES_PATH.exists() and not LATEST_OUTPUT_PATH.exists():
+        if not remote_get_file(REMOTE_LATEST_KEY, LATEST_OUTPUT_PATH):
+            shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+
+
+def sync_master_files_to_remote() -> None:
+    if not remote_storage_enabled():
+        return
+    remote_put_file(REMOTE_MASTER_KEY, MASTER_SALES_PATH)
+    remote_put_file(REMOTE_LATEST_KEY, LATEST_OUTPUT_PATH)
+
+
 def load_metadata() -> dict:
+    if remote_storage_enabled() and not METADATA_PATH.exists():
+        hydrate_remote_state()
     if not METADATA_PATH.exists():
         return {}
     try:
@@ -204,6 +298,7 @@ def save_metadata(metadata: dict) -> None:
     ensure_data_dir()
     metadata = ensure_metadata_schema(metadata)
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+    remote_put_json(REMOTE_METADATA_KEY, metadata)
 
 
 def update_owner_status(owner: str, **values) -> None:
@@ -240,10 +335,14 @@ def safe_filename(value: str, default: str = "销售排单.xlsx") -> str:
 
 
 def master_sales_exists() -> bool:
+    if not MASTER_SALES_PATH.exists() and remote_storage_enabled():
+        hydrate_remote_state()
     return MASTER_SALES_PATH.exists() and MASTER_SALES_PATH.stat().st_size > 0
 
 
 def storage_description() -> str:
+    if remote_storage_enabled():
+        return "当前已启用 Netlify Blobs 远程保存；Render 重启后会自动恢复本周排单和业务状态。"
     if str(DATA_DIR).startswith("/data"):
         return "当前使用 Render 持久磁盘目录 /data，网站重启后仍会保留本周数据。"
     return "当前使用临时目录；若 Render 服务重启或重新部署，本周数据可能丢失，请在 Render 增加持久磁盘并挂载到 /data。"
@@ -1099,6 +1198,7 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
                 ws[cell].value = parse_cell_edit_value(raw_value)
                 wb.save(MASTER_SALES_PATH)
                 shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+                sync_master_files_to_remote()
 
                 metadata = ensure_metadata_schema(load_metadata())
                 metadata["last_manual_edit_at"] = now_label()
@@ -1161,6 +1261,7 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
                 shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
             save_upload(sales_field, MASTER_SALES_PATH)
             shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+            sync_master_files_to_remote()
             save_metadata(
                 {
                     "master_name": original_name,
@@ -1231,6 +1332,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                 shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
                 shutil.copy2(output_path, MASTER_SALES_PATH)
                 shutil.copy2(output_path, LATEST_OUTPUT_PATH)
+                sync_master_files_to_remote()
 
                 metadata = load_metadata()
                 master_name = metadata.get("master_name", "销售排单.xlsx")
