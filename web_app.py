@@ -55,6 +55,12 @@ OWNER_GUIDES = {
     "叶振华": "读取预测文件中的“模组型号”或“料号”匹配销售排单“客户机种”。",
     "李海鹰": "读取预测文件中的“料号”匹配销售排单“客户机种”。",
 }
+OWNER_STATUS_LABELS = {
+    "pending": "未上传",
+    "running": "处理中",
+    "done": "已完成",
+    "error": "失败",
+}
 
 
 @lru_cache(maxsize=1)
@@ -158,9 +164,50 @@ def load_metadata() -> dict:
         return {}
 
 
+def default_owner_statuses() -> dict[str, dict[str, str]]:
+    return {
+        owner: {
+            "state": "pending",
+            "updated_rows": "",
+            "updated_at": "",
+            "prediction_name": "",
+            "error": "",
+        }
+        for owner in BUSINESS_OWNERS
+    }
+
+
+def ensure_metadata_schema(metadata: dict) -> dict:
+    statuses = metadata.get("owner_statuses")
+    if not isinstance(statuses, dict):
+        statuses = {}
+
+    normalized = default_owner_statuses()
+    for owner in BUSINESS_OWNERS:
+        raw = statuses.get(owner)
+        if isinstance(raw, dict):
+            normalized[owner].update({key: str(value) for key, value in raw.items() if value is not None})
+            if normalized[owner].get("state") not in OWNER_STATUS_LABELS:
+                normalized[owner]["state"] = "pending"
+
+    metadata["owner_statuses"] = normalized
+    return metadata
+
+
 def save_metadata(metadata: dict) -> None:
     ensure_data_dir()
+    metadata = ensure_metadata_schema(metadata)
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def update_owner_status(owner: str, **values) -> None:
+    with STATE_LOCK:
+        metadata = ensure_metadata_schema(load_metadata())
+        status = metadata["owner_statuses"].setdefault(owner, default_owner_statuses().get(owner, {}))
+        for key, value in values.items():
+            status[key] = "" if value is None else str(value)
+        metadata["owner_statuses"][owner] = status
+        save_metadata(metadata)
 
 
 def get_job_status() -> dict:
@@ -243,7 +290,7 @@ def render_page(
         f'<div class="notice success" role="status">{html.escape(message)}</div>' if message else ""
     )
     error_html = f'<div class="notice error" role="alert">{html.escape(error)}</div>' if error else ""
-    metadata = load_metadata()
+    metadata = ensure_metadata_schema(load_metadata())
     has_master = master_sales_exists()
     master_name = metadata.get("master_name", "未上传共用销售排单")
     master_time = metadata.get("master_uploaded_at", "")
@@ -269,6 +316,18 @@ def render_page(
     if latest_file and has_master:
         detail_parts.append(f"下载文件名：{latest_file}")
     detail_text = " ｜ ".join(detail_parts) if detail_parts else "共用排单会在每位业务上传预测后自动保存为最新版。"
+    owner_statuses = metadata.get("owner_statuses", default_owner_statuses())
+    owner_status_cards = "\n".join(
+        (
+            f'<div class="owner-status {html.escape(owner_statuses.get(owner, {}).get("state", "pending"))}">'
+            f'<strong>{html.escape(owner)}</strong>'
+            f'<span>{html.escape(OWNER_STATUS_LABELS.get(owner_statuses.get(owner, {}).get("state", "pending"), "未上传"))}</span>'
+            f'<small>{html.escape(owner_statuses.get(owner, {}).get("updated_rows", "")) + " 行" if owner_statuses.get(owner, {}).get("updated_rows") else "等待预测"}</small>'
+            f'<small>{html.escape(owner_statuses.get(owner, {}).get("updated_at", ""))}</small>'
+            f'</div>'
+        )
+        for owner in BUSINESS_OWNERS
+    )
     job = get_job_status()
     job_state = job.get("state", "idle")
     refresh_url = owner_link(selected_owner)
@@ -551,6 +610,50 @@ def render_page(
     .master-actions .upload-field {{
       flex: 1 1 320px;
     }}
+    .status-board {{
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }}
+    .owner-status {{
+      display: grid;
+      gap: 4px;
+      min-height: 92px;
+      padding: 12px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }}
+    .owner-status strong {{
+      font-size: 15px;
+    }}
+    .owner-status span {{
+      display: inline-flex;
+      width: fit-content;
+      padding: 3px 7px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 900;
+      color: var(--muted);
+      background: #eef1ec;
+    }}
+    .owner-status small {{
+      color: var(--muted);
+      line-height: 1.35;
+    }}
+    .owner-status.running span {{
+      color: var(--warn);
+      background: #fff4d7;
+    }}
+    .owner-status.done span {{
+      color: var(--success);
+      background: #e8f5ee;
+    }}
+    .owner-status.error span {{
+      color: var(--danger);
+      background: #fff0ee;
+    }}
     .actions {{
       display: flex;
       flex-wrap: wrap;
@@ -612,6 +715,7 @@ def render_page(
       .layout,
       .field-grid,
       .summary,
+      .status-board,
       .master-top {{
         grid-template-columns: 1fr;
         display: block;
@@ -654,6 +758,9 @@ def render_page(
           <button class="primary" type="submit">保存共用排单</button>
           {download_latest_html}
         </form>
+        <div class="status-board" aria-label="业务回填状态">
+          {owner_status_cards}
+        </div>
       </div>
     </section>
 
@@ -835,6 +942,7 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
                     "last_owner": "",
                     "last_generated_at": "",
                     "last_updated_rows": "",
+                    "owner_statuses": default_owner_statuses(),
                 }
             )
 
@@ -909,6 +1017,15 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                         "last_updated_rows": summary["updated_rows"],
                     }
                 )
+                metadata = ensure_metadata_schema(metadata)
+                metadata["owner_statuses"][selected_owner].update(
+                    {
+                        "state": "done",
+                        "updated_rows": str(summary["updated_rows"]),
+                        "updated_at": now_label(),
+                        "error": "",
+                    }
+                )
                 save_metadata(metadata)
 
         set_job_status(
@@ -926,6 +1043,13 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
             message="处理失败",
             finished_at=now_label(),
             updated_rows="",
+            error=str(exc),
+        )
+        update_owner_status(
+            selected_owner,
+            state="error",
+            updated_rows="",
+            updated_at=now_label(),
             error=str(exc),
         )
 
@@ -968,6 +1092,14 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         pred_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
         pred_path = UPLOAD_DIR / pred_name
         save_upload(pred_field, pred_path)
+        update_owner_status(
+            selected_owner,
+            state="running",
+            updated_rows="",
+            updated_at=now_label(),
+            prediction_name=safe_filename(pred_field.filename, "预测文件"),
+            error="",
+        )
         set_job_status(
             state="running",
             owner=selected_owner,
@@ -1030,7 +1162,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/status":
-            metadata = load_metadata()
+            metadata = ensure_metadata_schema(load_metadata())
             write_json(
                 self,
                 200,
@@ -1042,6 +1174,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                     "last_owner": metadata.get("last_owner", ""),
                     "last_generated_at": metadata.get("last_generated_at", ""),
                     "last_updated_rows": metadata.get("last_updated_rows", ""),
+                    "owner_statuses": metadata.get("owner_statuses", default_owner_statuses()),
                 },
             )
             return
