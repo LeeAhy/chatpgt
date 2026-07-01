@@ -271,12 +271,13 @@ def render_page(
     detail_text = " ｜ ".join(detail_parts) if detail_parts else "共用排单会在每位业务上传预测后自动保存为最新版。"
     job = get_job_status()
     job_state = job.get("state", "idle")
+    refresh_url = owner_link(selected_owner)
     if job_state == "running":
         job_html = (
             f'<div class="notice working" role="status">正在处理：{html.escape(job.get("owner", ""))} 的预测，'
             f'开始时间：{html.escape(job.get("started_at", ""))}。处理完成前请不要重复上传。</div>'
         )
-        refresh_meta = '<meta http-equiv="refresh" content="15">'
+        refresh_meta = f'<meta http-equiv="refresh" content="15; url={html.escape(refresh_url)}">'
     elif job_state == "done":
         job_html = (
             f'<div class="notice success" role="status">最近处理完成：{html.escape(job.get("owner", ""))}，'
@@ -1016,6 +1017,11 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
         if path in ("/", "/index.html") or path.startswith("/owner/"):
             owner = selected_owner_from_path(path, query)
+            write_html(self, 200, render_page(handler=self, selected_owner=owner).decode("utf-8"))
+            return
+
+        if path in ("/generate", "/sales-master"):
+            owner = selected_owner_from_path("/", query)
             write_html(self, 200, render_page(handler=self, selected_owner=owner).decode("utf-8"))
             return
 
