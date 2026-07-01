@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gc
 import math
 import os
 import re
@@ -1343,12 +1344,16 @@ def process_sales_workbooks(
     output_path = Path(output_path)
     as_of_date = as_of_date or date.today()
 
-    sales_wb = load_workbook(sales_path)
+    # Keep Render/free-server memory low: first read cached values for matching
+    # and price sources, release that workbook, then open the editable workbook.
     sales_values_wb = load_workbook(sales_path, read_only=False, data_only=True)
-
     sales_codes = collect_sales_codes(sales_values_wb, business_owner=business_owner)
     if not sales_codes:
         owner_note = f"（业务担当：{business_owner}）" if business_owner else ""
+        sales_values_wb.close()
+        del sales_values_wb
+        gc.collect()
+        sales_wb = load_workbook(sales_path)
         return unchanged_summary(
             sales_wb,
             output_path,
@@ -1365,6 +1370,10 @@ def process_sales_workbooks(
         as_of_date=as_of_date,
     )
     if not predictions:
+        sales_values_wb.close()
+        del sales_values_wb
+        gc.collect()
+        sales_wb = load_workbook(sales_path)
         return unchanged_summary(
             sales_wb,
             output_path,
@@ -1374,6 +1383,12 @@ def process_sales_workbooks(
             "预测信息里没有识别到可用的机种和数量，已生成未改动文件。",
         )
 
+    price_map, candidate_rows = build_price_sources(sales_values_wb)
+    sales_values_wb.close()
+    del sales_values_wb
+    gc.collect()
+
+    sales_wb = load_workbook(sales_path)
     fill_targets = [
         target
         for target in select_latest_fill_targets(find_fill_targets(sales_wb))
@@ -1389,8 +1404,6 @@ def process_sales_workbooks(
             "销售排单里没有找到空白的数量/金额栏，已生成未改动文件。",
         )
 
-    price_map, candidate_rows = build_price_sources(sales_values_wb)
-
     updates = []
     fallbacks = []
     missing_rows = []
@@ -1405,7 +1418,7 @@ def process_sales_workbooks(
             continue
 
         ws = sales_wb[target.sheet]
-        vws = sales_values_wb[target.sheet]
+        vws = ws
         source_columns = find_header_columns(vws)
         source_code_columns = find_code_columns(vws, source_columns)
         completed_qty_cols = (

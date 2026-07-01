@@ -276,25 +276,30 @@ def render_page(
             f'<div class="notice working" role="status">正在处理：{html.escape(job.get("owner", ""))} 的预测，'
             f'开始时间：{html.escape(job.get("started_at", ""))}。处理完成前请不要重复上传。</div>'
         )
+        refresh_meta = '<meta http-equiv="refresh" content="15">'
     elif job_state == "done":
         job_html = (
             f'<div class="notice success" role="status">最近处理完成：{html.escape(job.get("owner", ""))}，'
             f'更新 {html.escape(str(job.get("updated_rows", "")))} 行，'
             f'{html.escape(job.get("finished_at", ""))}。可以下载当前最新版。</div>'
         )
+        refresh_meta = ""
     elif job_state == "error":
         job_html = (
             f'<div class="notice error" role="alert">最近处理失败：{html.escape(job.get("owner", ""))}，'
             f'{html.escape(job.get("error", ""))}</div>'
         )
+        refresh_meta = ""
     else:
         job_html = ""
+        refresh_meta = ""
 
     page = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  {refresh_meta}
   <title>销售排单回填工作台</title>
   <style>
     :root {{
@@ -689,7 +694,7 @@ def render_page(
           </div>
           <div class="actions">
             <button class="primary" type="submit">开始回填</button>
-            <a class="secondary button" href="{owner_link(selected_owner)}">重置当前页面</a>
+            <a class="secondary button" href="{owner_link(selected_owner)}">刷新处理状态</a>
             {download_latest_html}
           </div>
         </form>
@@ -745,6 +750,17 @@ def write_text(
         handler.wfile.write(encoded)
 
 
+def write_json(handler: BaseHTTPRequestHandler, status: int, payload: dict, head: bool = False) -> None:
+    encoded = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(encoded)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    if not head:
+        handler.wfile.write(encoded)
+
+
 def save_upload(field: cgi.FieldStorage, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as out:
@@ -782,6 +798,9 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
         return
 
     try:
+        if job_is_running():
+            raise ValueError("当前有预测正在后台回填，请处理完成后再替换共用销售排单。")
+
         form = cgi.FieldStorage(
             fp=handler.rfile,
             headers=handler.headers,
@@ -1004,6 +1023,23 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_text(self, 200, "ok")
             return
 
+        if path == "/status":
+            metadata = load_metadata()
+            write_json(
+                self,
+                200,
+                {
+                    "job": get_job_status(),
+                    "master_exists": master_sales_exists(),
+                    "master_name": metadata.get("master_name", ""),
+                    "latest_name": metadata.get("latest_name", ""),
+                    "last_owner": metadata.get("last_owner", ""),
+                    "last_generated_at": metadata.get("last_generated_at", ""),
+                    "last_updated_rows": metadata.get("last_updated_rows", ""),
+                },
+            )
+            return
+
         if path == "/download/latest":
             if not master_sales_exists():
                 write_html(
@@ -1030,6 +1066,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
 
         if path == "/healthz":
             write_text(self, 200, "ok", head=True)
+            return
+
+        if path == "/status":
+            write_json(self, 200, {"ok": True}, head=True)
             return
 
         if path == "/download/latest":
