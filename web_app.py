@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import cgi
 import html
+import json
 from functools import lru_cache
 import os
 import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import urllib.parse
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -27,6 +30,12 @@ UPLOAD_MIME = "multipart/form-data"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PUBLIC_URL_ENV_VARS = ("PUBLIC_URL", "RENDER_EXTERNAL_URL", "APP_URL", "SITE_URL")
 DEFAULT_OWNER = BUSINESS_OWNERS[0]
+DATA_DIR = Path(os.environ.get("SALES_DATA_DIR", "/data/sales-upload" if Path("/data").exists() else "server_data"))
+MASTER_SALES_PATH = DATA_DIR / "current_sales.xlsx"
+LATEST_OUTPUT_PATH = DATA_DIR / "latest_generated.xlsx"
+METADATA_PATH = DATA_DIR / "metadata.json"
+BACKUP_DIR = DATA_DIR / "backups"
+STATE_LOCK = threading.Lock()
 OWNER_GUIDES = {
     "洪鸣": "读取预测文件中的 New part NO 匹配销售排单“客户机种”。",
     "李玎玲": "优先识别截图里的“机种名”和 6-10 月预测数量，自动匹配销售排单“客户机种”；数量单位 K 会自动换算成万 pcs。",
@@ -123,6 +132,47 @@ def owner_link(owner: str) -> str:
     return f"/owner/{urllib.parse.quote(owner)}"
 
 
+def ensure_data_dir() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_metadata() -> dict:
+    if not METADATA_PATH.exists():
+        return {}
+    try:
+        return json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_metadata(metadata: dict) -> None:
+    ensure_data_dir()
+    METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def now_label() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_filename(value: str, default: str = "销售排单.xlsx") -> str:
+    name = os.path.basename(str(value).replace("\\", "/")).strip()
+    return name or default
+
+
+def master_sales_exists() -> bool:
+    return MASTER_SALES_PATH.exists() and MASTER_SALES_PATH.stat().st_size > 0
+
+
+def format_file_size(path: Path) -> str:
+    if not path.exists():
+        return "0 KB"
+    size = path.stat().st_size
+    if size >= 1024 * 1024:
+        return f"{size / 1024 / 1024:.1f} MB"
+    return f"{max(size / 1024, 1):.0f} KB"
+
+
 def selected_owner_from_path(path: str, query: dict[str, list[str]]) -> str:
     if path.startswith("/owner/"):
         return safe_owner(path.removeprefix("/owner/"))
@@ -167,6 +217,32 @@ def render_page(
         f'<div class="notice success" role="status">{html.escape(message)}</div>' if message else ""
     )
     error_html = f'<div class="notice error" role="alert">{html.escape(error)}</div>' if error else ""
+    metadata = load_metadata()
+    has_master = master_sales_exists()
+    master_name = metadata.get("master_name", "未上传共用销售排单")
+    master_time = metadata.get("master_uploaded_at", "")
+    latest_owner = metadata.get("last_owner", "")
+    latest_time = metadata.get("last_generated_at", "")
+    latest_rows = metadata.get("last_updated_rows", "")
+    latest_file = metadata.get("latest_name", metadata.get("master_name", "最新销售排单.xlsx"))
+    master_status = "已启用" if has_master else "待上传"
+    master_status_class = "ready" if has_master else "empty"
+    download_latest_html = (
+        '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
+    )
+    state_text = (
+        f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
+        if has_master
+        else "请先上传本周共用销售排单，然后各业务只上传自己的预测。"
+    )
+    detail_parts = []
+    if master_time:
+        detail_parts.append(f"初始化/替换时间：{master_time}")
+    if latest_owner:
+        detail_parts.append(f"最近回填：{latest_owner}，更新 {latest_rows} 行，{latest_time}")
+    if latest_file and has_master:
+        detail_parts.append(f"下载文件名：{latest_file}")
+    detail_text = " ｜ ".join(detail_parts) if detail_parts else "共用排单会在每位业务上传预测后自动保存为最新版。"
 
     page = f"""<!doctype html>
 <html lang="zh-CN">
@@ -307,6 +383,14 @@ def render_page(
       font-weight: 800;
       white-space: nowrap;
     }}
+    .badge.ready {{
+      background: #e8f5ee;
+      color: var(--success);
+    }}
+    .badge.empty {{
+      background: #fff0ee;
+      color: var(--danger);
+    }}
     .notice {{
       margin: 0 0 14px;
       padding: 12px 14px;
@@ -373,6 +457,43 @@ def render_page(
       font-size: 13px;
       font-weight: 600;
     }}
+    .master-panel {{
+      margin-top: 18px;
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }}
+    .master-card {{
+      display: grid;
+      gap: 10px;
+      padding: 14px;
+      border: 1px solid #cfe0d7;
+      border-radius: 8px;
+      background: #f8fbf8;
+    }}
+    .master-top {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .master-title {{
+      margin: 0;
+      font-size: 17px;
+      font-weight: 900;
+    }}
+    .master-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: end;
+      margin-top: 12px;
+    }}
+    .master-actions .upload-field {{
+      flex: 1 1 320px;
+    }}
     .actions {{
       display: flex;
       flex-wrap: wrap;
@@ -433,8 +554,10 @@ def render_page(
       }}
       .layout,
       .field-grid,
-      .summary {{
+      .summary,
+      .master-top {{
         grid-template-columns: 1fr;
+        display: block;
       }}
       .rail {{
         position: static;
@@ -450,9 +573,31 @@ def render_page(
     <section class="topline">
       <div>
         <h1>销售排单回填工作台</h1>
-        <p class="subtext">选择业务担当，上传该担当的预测信息和销售排单。系统会按不同业务担当读取对应字段匹配“客户机种”，当月客户总预测会先扣掉已完成数据，再写入销售排单当前预留的空白数量/金额栏。</p>
+        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测，系统会按机种分别补充 6/29预估（7月）、6/29预估（8月）等每个月的预估数量和金额。</p>
       </div>
       <div class="access">{html.escape(access_note)}</div>
+    </section>
+
+    <section class="master-panel" aria-label="共用销售排单">
+      <div class="master-card">
+        <div class="master-top">
+          <div>
+            <p class="master-title">共用销售排单</p>
+            <p class="subtext">{html.escape(state_text)}</p>
+            <p class="hint">{html.escape(detail_text)}</p>
+          </div>
+          <div class="badge {master_status_class}">{html.escape(master_status)}</div>
+        </div>
+        <form class="master-actions" method="post" action="/sales-master" enctype="multipart/form-data">
+          <div class="upload-field">
+            <label for="master_sales_file">上传/替换本周共用销售排单</label>
+            <input id="master_sales_file" name="sales_file" type="file" accept=".xlsx,.xlsm" required>
+            <div class="hint">只有共用排单需要上传一次；各业务后续只上传预测。替换排单会从新文件重新开始。</div>
+          </div>
+          <button class="primary" type="submit">保存共用排单</button>
+          {download_latest_html}
+        </form>
+      </div>
     </section>
 
     <section class="layout">
@@ -467,7 +612,7 @@ def render_page(
         <div class="panel-head">
           <div>
             <h2>{html.escape(selected_owner)} 的预测上传</h2>
-            <p class="subtext">{html.escape(upload_hint)} 销售排单必须保留“业务担当”和“客户机种”。</p>
+            <p class="subtext">{html.escape(upload_hint)} 预测会写入上方共用销售排单，销售排单必须保留“业务担当”和“客户机种”。</p>
           </div>
           <div class="badge">无需登录</div>
         </div>
@@ -476,7 +621,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>当月会自动扣减同一客户机种已完成数量；扣完小于 0 时按 0 回填。</span>
+            <span>当月会自动扣减同一客户机种已完成数量；后续月份按对应月份预估栏回填。每次回填都会保存为共用排单最新版。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -485,17 +630,10 @@ def render_page(
             </select>
             <div class="hint">只会回填销售排单中属于所选业务担当的行。</div>
           </div>
-          <div class="field-grid">
-            <div>
-              <label for="prediction_file">预测信息</label>
-              <input id="prediction_file" name="prediction_file" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.png,.jpg,.jpeg,.webp,.heic,.tif,.tiff" required>
-              <div class="hint">支持 Excel、CSV、TXT；截图入口已接入，系统 OCR 可用时会自动识别。</div>
-            </div>
-            <div>
-              <label for="sales_file">销售排单</label>
-              <input id="sales_file" name="sales_file" type="file" accept=".xlsx,.xlsm" required>
-              <div class="hint">系统会自动找销售排单里当前空白的数量/金额列。</div>
-            </div>
+          <div>
+            <label for="prediction_file">预测信息</label>
+            <input id="prediction_file" name="prediction_file" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.png,.jpg,.jpeg,.webp,.heic,.tif,.tiff" required>
+            <div class="hint">支持 Excel、CSV、TXT；截图入口已接入，系统 OCR 可用时会自动识别。无需再上传销售排单。</div>
           </div>
           <div class="actions">
             <button class="primary" type="submit">生成回填文件</button>
@@ -567,12 +705,90 @@ def first_upload(form: cgi.FieldStorage, name: str):
     return field
 
 
+def send_xlsx(handler: BaseHTTPRequestHandler, path: Path, download_name: str, head: bool = False) -> None:
+    file_size = path.stat().st_size
+    handler.send_response(200)
+    handler.send_header("Content-Type", XLSX_MIME)
+    handler.send_header("Content-Disposition", content_disposition(download_name))
+    handler.send_header("Content-Length", str(file_size))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    if not head:
+        with path.open("rb") as f:
+            shutil.copyfileobj(f, handler.wfile)
+
+
+def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
+    if handler.headers.get_content_type() != UPLOAD_MIME:
+        write_html(
+            handler,
+            400,
+            render_page(error="请使用网页表单上传共用销售排单。", handler=handler).decode("utf-8"),
+            head=head,
+        )
+        return
+
+    try:
+        form = cgi.FieldStorage(
+            fp=handler.rfile,
+            headers=handler.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": handler.headers.get("Content-Type", ""),
+                "CONTENT_LENGTH": handler.headers.get("Content-Length", "0"),
+            },
+        )
+        sales_field = first_upload(form, "sales_file")
+        if not getattr(sales_field, "filename", None):
+            raise ValueError("请先选择共用销售排单文件。")
+
+        sales_suffix = uploaded_suffix(sales_field.filename)
+        if sales_suffix not in SUPPORTED_SALES_SUFFIXES:
+            raise ValueError("共用销售排单请上传 .xlsx 或 .xlsm 文件。")
+
+        original_name = safe_filename(sales_field.filename)
+        with STATE_LOCK:
+            ensure_data_dir()
+            if master_sales_exists():
+                backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + MASTER_SALES_PATH.name
+                shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
+            save_upload(sales_field, MASTER_SALES_PATH)
+            shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+            save_metadata(
+                {
+                    "master_name": original_name,
+                    "master_uploaded_at": now_label(),
+                    "latest_name": f"{Path(original_name).stem}_当前最新版.xlsx",
+                    "last_owner": "",
+                    "last_generated_at": "",
+                    "last_updated_rows": "",
+                }
+            )
+
+        write_html(
+            handler,
+            200,
+            render_page(
+                message=f"共用销售排单已保存：{original_name}。现在各业务只需要上传自己的预测。",
+                handler=handler,
+            ).decode("utf-8"),
+            head=head,
+        )
+    except Exception as exc:  # noqa: BLE001
+        write_html(
+            handler,
+            400,
+            render_page(error=f"保存共用排单失败：{exc}", handler=handler).decode("utf-8"),
+            head=head,
+        )
+
+
 def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
     if handler.headers.get_content_type() != UPLOAD_MIME:
         write_html(
             handler,
             400,
-            render_page(error="请使用网页表单上传预测信息和销售排单。", handler=handler).decode("utf-8"),
+            render_page(error="请使用网页表单上传预测信息。", handler=handler).decode("utf-8"),
             head=head,
         )
         return
@@ -590,43 +806,59 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         )
         selected_owner = safe_owner(form.getfirst("business_owner", DEFAULT_OWNER))
         pred_field = first_upload(form, "prediction_file")
-        sales_field = first_upload(form, "sales_file")
-        if not getattr(pred_field, "filename", None) or not getattr(sales_field, "filename", None):
-            raise ValueError("请先选择预测信息和销售排单两个文件。")
+        if not getattr(pred_field, "filename", None):
+            raise ValueError("请先选择预测信息文件。")
 
         pred_suffix = uploaded_suffix(pred_field.filename)
-        sales_suffix = uploaded_suffix(sales_field.filename)
         if pred_suffix not in SUPPORTED_PREDICTION_SUFFIXES:
             raise ValueError("预测信息请上传 Excel、CSV、TXT 或图片文件。")
-        if sales_suffix not in SUPPORTED_SALES_SUFFIXES:
-            raise ValueError("销售排单请上传 .xlsx 或 .xlsm 文件。")
+        if not master_sales_exists():
+            raise ValueError("请先在页面上方上传本周共用销售排单。")
 
         with tempfile.TemporaryDirectory(prefix="sales_upload_") as tmp_dir:
             tmp_path = Path(tmp_dir)
             pred_path = tmp_path / f"prediction{pred_suffix}"
-            sales_path = tmp_path / f"sales{sales_suffix}"
             output_path = tmp_path / "generated.xlsx"
 
             save_upload(pred_field, pred_path)
-            save_upload(sales_field, sales_path)
 
-            summary = process_sales_workbooks(
-                pred_path=pred_path,
-                sales_path=sales_path,
-                output_path=output_path,
-                freeze_formulas=True,
-                business_owner=selected_owner,
-            )
+            with STATE_LOCK:
+                if not master_sales_exists():
+                    raise ValueError("请先在页面上方上传本周共用销售排单。")
+                ensure_data_dir()
+                working_sales_path = tmp_path / "current_sales.xlsx"
+                shutil.copy2(MASTER_SALES_PATH, working_sales_path)
+                summary = process_sales_workbooks(
+                    pred_path=pred_path,
+                    sales_path=working_sales_path,
+                    output_path=output_path,
+                    freeze_formulas=True,
+                    business_owner=selected_owner,
+                )
 
-            original_name = os.path.basename(str(sales_field.filename).replace("\\", "/"))
-            stem = Path(original_name).stem if original_name else "销售排单"
-            download_name = f"{stem}_{selected_owner}_已回填.xlsx"
-            file_size = output_path.stat().st_size
+                backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}_before.xlsx"
+                shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
+                shutil.copy2(output_path, MASTER_SALES_PATH)
+                shutil.copy2(output_path, LATEST_OUTPUT_PATH)
+
+                metadata = load_metadata()
+                master_name = metadata.get("master_name", "销售排单.xlsx")
+                stem = Path(master_name).stem if master_name else "销售排单"
+                download_name = f"{stem}_{selected_owner}_已回填_当前最新版.xlsx"
+                metadata.update(
+                    {
+                        "latest_name": download_name,
+                        "last_owner": selected_owner,
+                        "last_generated_at": now_label(),
+                        "last_updated_rows": summary["updated_rows"],
+                    }
+                )
+                save_metadata(metadata)
 
             handler.send_response(200)
             handler.send_header("Content-Type", XLSX_MIME)
             handler.send_header("Content-Disposition", content_disposition(download_name))
-            handler.send_header("Content-Length", str(file_size))
+            handler.send_header("Content-Length", str(LATEST_OUTPUT_PATH.stat().st_size))
             handler.send_header("X-Updated-Rows", str(summary["updated_rows"]))
             if summary.get("warnings"):
                 handler.send_header("X-Warnings", urllib.parse.quote("；".join(summary["warnings"])))
@@ -635,7 +867,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             handler.send_header("Cache-Control", "no-store")
             handler.end_headers()
             if not head:
-                with output_path.open("rb") as f:
+                with LATEST_OUTPUT_PATH.open("rb") as f:
                     shutil.copyfileobj(f, handler.wfile)
         return
     except Exception as exc:  # noqa: BLE001
@@ -666,6 +898,19 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_text(self, 200, "ok")
             return
 
+        if path == "/download/latest":
+            if not master_sales_exists():
+                write_html(
+                    self,
+                    404,
+                    render_page(error="还没有共用销售排单可下载，请先上传本周排单。", handler=self).decode("utf-8"),
+                )
+                return
+            metadata = load_metadata()
+            download_name = metadata.get("latest_name") or metadata.get("master_name") or "销售排单_当前最新版.xlsx"
+            send_xlsx(self, MASTER_SALES_PATH, download_name)
+            return
+
         write_text(self, 404, "Not found")
 
     def do_HEAD(self):
@@ -681,10 +926,23 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_text(self, 200, "ok", head=True)
             return
 
+        if path == "/download/latest":
+            if not master_sales_exists():
+                write_text(self, 404, "Not found", head=True)
+                return
+            metadata = load_metadata()
+            download_name = metadata.get("latest_name") or metadata.get("master_name") or "销售排单_当前最新版.xlsx"
+            send_xlsx(self, MASTER_SALES_PATH, download_name, head=True)
+            return
+
         write_text(self, 404, "Not found", head=True)
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/sales-master":
+            handle_sales_master(self)
+            return
+
         if parsed.path != "/generate":
             write_text(self, 404, "Not found")
             return
