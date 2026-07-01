@@ -1298,6 +1298,7 @@ def unchanged_summary(
         "fallbacks": [],
         "missing_rows": [],
         "skipped_months": [],
+        "zero_filled_rows": [],
         "fill_targets": [],
         "business_owner": business_owner,
         "as_of_date": as_of_date,
@@ -1329,6 +1330,57 @@ def remaining_current_month_qty(
     completed_qty: float,
 ) -> float:
     return round(max(qty - completed_qty, 0.0), 4)
+
+
+def previous_estimate_pair(ws, target: FillTarget) -> Optional[QuantityAmountPair]:
+    candidates = []
+    for pair in find_quantity_amount_pairs(ws):
+        if pair.qty_col >= target.qty_col:
+            continue
+        if "预估" not in pair.label:
+            continue
+        if any(word in pair.label for word in NO_FILL_LABEL_WORDS):
+            continue
+        candidates.append(pair)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda pair: pair.qty_col)
+
+
+def build_previous_estimate_cache(
+    sales_values_wb,
+    fill_targets: Iterable[FillTarget],
+) -> dict[tuple[str, int, int], tuple[Optional[float], Optional[float]]]:
+    previous_values: dict[tuple[str, int, int], tuple[Optional[float], Optional[float]]] = {}
+    for target in fill_targets:
+        ws = sales_values_wb[target.sheet]
+        previous_pair = previous_estimate_pair(ws, target)
+        if previous_pair is None:
+            continue
+        for row in iter_sales_data_rows(ws):
+            previous_values[(target.sheet, target.qty_col, row)] = (
+                parse_number(ws.cell(row, previous_pair.qty_col).value),
+                parse_number(ws.cell(row, previous_pair.amt_col).value),
+            )
+    return previous_values
+
+
+def amount_from_previous_week(
+    qty: float,
+    previous_qty: Optional[float],
+    previous_amount: Optional[float],
+) -> float:
+    if previous_qty is None or previous_amount is None or previous_qty == 0:
+        return 0.0
+    return round(qty * previous_amount / previous_qty, 4)
+
+
+def cell_has_existing_nonzero_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str) and value.startswith("="):
+        return False
+    return not is_zero_placeholder(value)
 
 
 def process_sales_workbooks(
@@ -1383,17 +1435,17 @@ def process_sales_workbooks(
             "预测信息里没有识别到可用的机种和数量，已生成未改动文件。",
         )
 
-    price_map, candidate_rows = build_price_sources(sales_values_wb)
+    fill_targets = [
+        target
+        for target in select_latest_fill_targets(find_fill_targets(sales_values_wb))
+        if target.month >= as_of_date.month
+    ]
+    previous_estimate_values = build_previous_estimate_cache(sales_values_wb, fill_targets)
     sales_values_wb.close()
     del sales_values_wb
     gc.collect()
 
     sales_wb = load_workbook(sales_path)
-    fill_targets = [
-        target
-        for target in select_latest_fill_targets(find_fill_targets(sales_wb))
-        if target.month >= as_of_date.month
-    ]
     if not fill_targets:
         return unchanged_summary(
             sales_wb,
@@ -1410,12 +1462,12 @@ def process_sales_workbooks(
     skipped_months = []
     completed_deductions = []
     skipped_existing_values = []
+    zero_filled_rows = []
     warnings = []
 
     for target in fill_targets:
         if not any(month_map.get(target.month) is not None for month_map in predictions.values()):
             skipped_months.append((target.sheet, target.label, target.month))
-            continue
 
         ws = sales_wb[target.sheet]
         vws = ws
@@ -1429,6 +1481,7 @@ def process_sales_workbooks(
         code_to_row = {}
         normalized_code_to_code = {}
         row_meta = {}
+        eligible_rows: dict[int, list[str]] = {}
         for row in iter_sales_data_rows(ws):
             owner = clean_text(vws.cell(row, target.owner_col).value)
             if business_owner and not owner_matches(business_owner, owner):
@@ -1444,6 +1497,7 @@ def process_sales_workbooks(
             if not row_codes:
                 continue
 
+            eligible_rows[row] = row_codes
             meta = {
                 "O": vws[f"O{row}"].value,
                 "R": vws[f"R{row}"].value,
@@ -1459,6 +1513,7 @@ def process_sales_workbooks(
                 if norm_code:
                     normalized_code_to_code[norm_code] = code
 
+        touched_rows: set[int] = set()
         for code, month_map in predictions.items():
             qty = month_map.get(target.month)
             if qty is None:
@@ -1478,13 +1533,8 @@ def process_sales_workbooks(
             qty_cell = ws.cell(row, target.qty_col)
             amt_cell = ws.cell(row, target.amt_col)
 
-            amt_has_formula = isinstance(amt_cell.value, str) and amt_cell.value.startswith("=")
-            qty_has_existing_value = qty_cell.value is not None and not is_zero_placeholder(qty_cell.value)
-            amt_has_existing_value = (
-                amt_cell.value is not None
-                and not amt_has_formula
-                and not is_zero_placeholder(amt_cell.value)
-            )
+            qty_has_existing_value = cell_has_existing_nonzero_value(qty_cell.value)
+            amt_has_existing_value = cell_has_existing_nonzero_value(amt_cell.value)
             if qty_has_existing_value or amt_has_existing_value:
                 skipped_existing_values.append(
                     (
@@ -1508,38 +1558,14 @@ def process_sales_workbooks(
             qty_cell.value = qty
             qty_cell.number_format = "0.0000"
 
-            price = price_map.get(code)
-            if price is None:
-                price = price_map.get(matched_code)
-            fallback = None
-            if price is None:
-                fallback = choose_fallback_price(
-                    row_meta[matched_code],
-                    candidate_rows,
-                    price_map,
-                    business_owner=business_owner,
-                )
-                if fallback is not None:
-                    price = fallback["price"]
-                    fallbacks.append(
-                        (
-                            target.sheet,
-                            code,
-                            fallback["source_code"],
-                            fallback["source_sheet"],
-                            fallback["source_row"],
-                            fallback["score"],
-                            price,
-                        )
-                    )
-
-            amount = None
-            if amt_has_formula:
-                amount = amt_cell.value
-            else:
-                amount = round(qty * price, 4) if price is not None else 0.0
-                amt_cell.value = amount
-                amt_cell.number_format = "0.00"
+            previous_qty, previous_amount = previous_estimate_values.get(
+                (target.sheet, target.qty_col, row),
+                (None, None),
+            )
+            amount = amount_from_previous_week(qty, previous_qty, previous_amount)
+            amt_cell.value = amount
+            amt_cell.number_format = "0.00"
+            touched_rows.add(row)
 
             updates.append(
                 (
@@ -1550,12 +1576,38 @@ def process_sales_workbooks(
                     get_column_letter(target.qty_col),
                     qty,
                     amount,
-                    price,
+                    None,
                     business_owner or clean_text(vws.cell(row, target.owner_col).value),
                 )
             )
 
-    if not updates:
+        for row, row_codes in eligible_rows.items():
+            if row in touched_rows:
+                continue
+
+            qty_cell = ws.cell(row, target.qty_col)
+            amt_cell = ws.cell(row, target.amt_col)
+            qty_has_existing_value = cell_has_existing_nonzero_value(qty_cell.value)
+            amt_has_existing_value = cell_has_existing_nonzero_value(amt_cell.value)
+            if qty_has_existing_value or amt_has_existing_value:
+                continue
+
+            qty_cell.value = 0
+            qty_cell.number_format = "0.0000"
+            amt_cell.value = 0
+            amt_cell.number_format = "0.00"
+            zero_filled_rows.append(
+                (
+                    target.sheet,
+                    row,
+                    row_codes[0],
+                    target.label,
+                    get_column_letter(target.qty_col),
+                    business_owner or clean_text(vws.cell(row, target.owner_col).value),
+                )
+            )
+
+    if not updates and not zero_filled_rows:
         warnings.append("没有找到可回填的匹配行，已生成未改动文件。")
 
     calc = getattr(sales_wb, "calculation", None)
@@ -1568,11 +1620,12 @@ def process_sales_workbooks(
 
     summary = {
         "output_path": output_path,
-        "updated_rows": len(updates),
+        "updated_rows": len(updates) + len(zero_filled_rows),
         "fallbacks": fallbacks,
         "missing_rows": missing_rows,
         "skipped_months": skipped_months,
         "skipped_existing_values": skipped_existing_values,
+        "zero_filled_rows": zero_filled_rows,
         "fill_targets": fill_targets,
         "business_owner": business_owner,
         "as_of_date": as_of_date,
@@ -1592,6 +1645,7 @@ def process_sales_workbooks(
             get_column_letter(target.amt_col),
         )
     print(f"updated rows: {len(updates)}")
+    print(f"total written rows including zero fills: {len(updates) + len(zero_filled_rows)}")
     print(f"fallback prices used: {len(fallbacks)}")
     for item in fallbacks[:10]:
         print("fallback", item)
@@ -1601,6 +1655,9 @@ def process_sales_workbooks(
     print(f"skipped existing forecast cells: {len(skipped_existing_values)}")
     for item in skipped_existing_values[:20]:
         print("existing", item)
+    print(f"zero-filled rows: {len(zero_filled_rows)}")
+    for item in zero_filled_rows[:20]:
+        print("zero_filled", item)
     print(f"completed deductions: {len(completed_deductions)}")
     for item in completed_deductions[:20]:
         print("completed_deduction", item)

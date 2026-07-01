@@ -5,6 +5,7 @@ import html
 import json
 from functools import lru_cache
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -15,6 +16,10 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import coordinate_to_tuple
 
 from fill_sales import (
     BUSINESS_OWNERS,
@@ -170,6 +175,7 @@ def default_owner_statuses() -> dict[str, dict[str, str]]:
             "state": "pending",
             "updated_rows": "",
             "updated_at": "",
+            "uploaded_at": "",
             "prediction_name": "",
             "error": "",
         }
@@ -235,6 +241,12 @@ def safe_filename(value: str, default: str = "销售排单.xlsx") -> str:
 
 def master_sales_exists() -> bool:
     return MASTER_SALES_PATH.exists() and MASTER_SALES_PATH.stat().st_size > 0
+
+
+def storage_description() -> str:
+    if str(DATA_DIR).startswith("/data"):
+        return "当前使用 Render 持久磁盘目录 /data，网站重启后仍会保留本周数据。"
+    return "当前使用临时目录；若 Render 服务重启或重新部署，本周数据可能丢失，请在 Render 增加持久磁盘并挂载到 /data。"
 
 
 def format_file_size(path: Path) -> str:
@@ -303,6 +315,9 @@ def render_page(
     download_latest_html = (
         '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
     )
+    preview_latest_html = (
+        '<a class="secondary button" href="/preview">在线预览/编辑</a>' if has_master else ""
+    )
     state_text = (
         f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
         if has_master
@@ -315,19 +330,29 @@ def render_page(
         detail_parts.append(f"最近回填：{latest_owner}，更新 {latest_rows} 行，{latest_time}")
     if latest_file and has_master:
         detail_parts.append(f"下载文件名：{latest_file}")
+    detail_parts.append(storage_description())
     detail_text = " ｜ ".join(detail_parts) if detail_parts else "共用排单会在每位业务上传预测后自动保存为最新版。"
     owner_statuses = metadata.get("owner_statuses", default_owner_statuses())
-    owner_status_cards = "\n".join(
-        (
-            f'<div class="owner-status {html.escape(owner_statuses.get(owner, {}).get("state", "pending"))}">'
+    owner_status_card_items = []
+    for owner in BUSINESS_OWNERS:
+        status = owner_statuses.get(owner, {})
+        state = status.get("state", "pending")
+        row_text = f'{html.escape(status.get("updated_rows", ""))} 行' if status.get("updated_rows") else "等待预测"
+        prediction_name = status.get("prediction_name") or "暂无上传记录"
+        uploaded_at = status.get("uploaded_at") or status.get("updated_at") or ""
+        done_at = status.get("updated_at") or ""
+        error_text = status.get("error") or ""
+        owner_status_card_items.append(
+            f'<div class="owner-status {html.escape(state)}">'
             f'<strong>{html.escape(owner)}</strong>'
-            f'<span>{html.escape(OWNER_STATUS_LABELS.get(owner_statuses.get(owner, {}).get("state", "pending"), "未上传"))}</span>'
-            f'<small>{html.escape(owner_statuses.get(owner, {}).get("updated_rows", "")) + " 行" if owner_statuses.get(owner, {}).get("updated_rows") else "等待预测"}</small>'
-            f'<small>{html.escape(owner_statuses.get(owner, {}).get("updated_at", ""))}</small>'
+            f'<span>{html.escape(OWNER_STATUS_LABELS.get(state, "未上传"))}</span>'
+            f'<small>最近文件：{html.escape(prediction_name)}</small>'
+            f'<small>上传时间：{html.escape(uploaded_at or "未上传")}</small>'
+            f'<small>回填结果：{row_text}{("，" + html.escape(done_at)) if done_at else ""}</small>'
+            f'{f"<small>错误：{html.escape(error_text)}</small>" if error_text else ""}'
             f'</div>'
         )
-        for owner in BUSINESS_OWNERS
-    )
+    owner_status_cards = "\n".join(owner_status_card_items)
     job = get_job_status()
     job_state = job.get("state", "idle")
     refresh_url = owner_link(selected_owner)
@@ -757,6 +782,7 @@ def render_page(
           </div>
           <button class="primary" type="submit">保存共用排单</button>
           {download_latest_html}
+          {preview_latest_html}
         </form>
         <div class="status-board" aria-label="业务回填状态">
           {owner_status_cards}
@@ -804,6 +830,7 @@ def render_page(
             <button class="primary" type="submit">开始回填</button>
             <a class="secondary button" href="{owner_link(selected_owner)}">刷新处理状态</a>
             {download_latest_html}
+            {preview_latest_html}
           </div>
         </form>
       </section>
@@ -893,6 +920,206 @@ def send_xlsx(handler: BaseHTTPRequestHandler, path: Path, download_name: str, h
     if not head:
         with path.open("rb") as f:
             shutil.copyfileobj(f, handler.wfile)
+
+
+def parse_cell_edit_value(raw_value: str):
+    value = raw_value.strip()
+    if value == "":
+        return None
+    if value.startswith("="):
+        return value
+    if re.fullmatch(r"-?\d+", value) and not re.match(r"-?0\d+", value):
+        return int(value)
+    if re.fullmatch(r"-?(?:\d+\.\d+|\d+\.|\.\d+)", value):
+        return float(value)
+    return raw_value
+
+
+def render_preview_page(
+    message: str = "",
+    error: str = "",
+    selected_sheet: str = "",
+    rows_limit: int = 80,
+) -> bytes:
+    if not master_sales_exists():
+        return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
+
+    metadata = ensure_metadata_schema(load_metadata())
+    message_html = f'<div class="notice success">{html.escape(message)}</div>' if message else ""
+    error_html = f'<div class="notice error">{html.escape(error)}</div>' if error else ""
+    rows_limit = max(20, min(rows_limit, 200))
+
+    wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=False)
+    try:
+        sheet_names = wb.sheetnames
+        if selected_sheet not in sheet_names:
+            selected_sheet = sheet_names[0]
+        ws = wb[selected_sheet]
+        max_row = min(ws.max_row, rows_limit)
+        max_col = min(ws.max_column, 80)
+        sheet_options = "\n".join(
+            f'<option value="{html.escape(name)}" {"selected" if name == selected_sheet else ""}>{html.escape(name)}</option>'
+            for name in sheet_names
+        )
+        header_cells = "".join(f"<th>{get_column_letter(col)}</th>" for col in range(1, max_col + 1))
+        body_rows = []
+        for row_idx in range(1, max_row + 1):
+            cells = [f"<th>{row_idx}</th>"]
+            for col_idx in range(1, max_col + 1):
+                value = ws.cell(row_idx, col_idx).value
+                display = "" if value is None else str(value)
+                if len(display) > 80:
+                    display = display[:77] + "..."
+                coord = f"{get_column_letter(col_idx)}{row_idx}"
+                cells.append(f'<td title="{html.escape(coord)}">{html.escape(display)}</td>')
+            body_rows.append("<tr>" + "".join(cells) + "</tr>")
+        table_html = "\n".join(body_rows)
+    finally:
+        wb.close()
+
+    latest_name = metadata.get("latest_name") or metadata.get("master_name") or "当前最新版"
+    page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>在线预览/编辑</title>
+  <style>
+    :root {{
+      --paper: #f6f7f4;
+      --panel: #ffffff;
+      --line: #d8ded5;
+      --text: #17211b;
+      --muted: #5f6b63;
+      --accent: #136f63;
+      --danger: #b42318;
+      --success: #126b45;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: var(--text);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--paper);
+    }}
+    .shell {{ width: min(1380px, calc(100% - 28px)); margin: 0 auto; padding: 22px 0 40px; }}
+    .top {{ display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; margin-bottom: 16px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    .subtext {{ margin: 0; color: var(--muted); line-height: 1.6; }}
+    .panel {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
+    .notice {{ margin: 0 0 14px; padding: 12px 14px; border-radius: 8px; line-height: 1.6; font-weight: 800; }}
+    .notice.success {{ color: var(--success); background: #e8f5ee; border: 1px solid #bbdec9; }}
+    .notice.error {{ color: var(--danger); background: #fff0ee; border: 1px solid #f3c3bd; }}
+    form {{ display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }}
+    label {{ display: grid; gap: 6px; font-weight: 800; }}
+    input, select {{ min-height: 40px; border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: inherit; }}
+    button, .button {{ min-height: 40px; border: 0; border-radius: 7px; padding: 9px 14px; font: inherit; font-weight: 800; text-decoration: none; cursor: pointer; }}
+    .primary {{ color: #fff; background: var(--accent); }}
+    .secondary {{ color: #0c4f47; background: #e9f3ee; border: 1px solid #bdd9cd; display: inline-flex; align-items: center; }}
+    .table-wrap {{ overflow: auto; max-height: 72vh; border: 1px solid var(--line); border-radius: 8px; background: #fff; }}
+    table {{ border-collapse: collapse; min-width: 100%; font-size: 12px; }}
+    th, td {{ border: 1px solid #d7ddd4; padding: 5px 7px; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }}
+    th {{ position: sticky; top: 0; background: #e8efe9; z-index: 1; }}
+    tr th:first-child {{ position: sticky; left: 0; z-index: 2; background: #e8efe9; }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="top">
+      <div>
+        <h1>在线预览/编辑当前最新版</h1>
+        <p class="subtext">当前文件：{html.escape(latest_name)}。预览最多显示前 {rows_limit} 行、前 80 列；修改会直接保存到网站当前共用表格。</p>
+      </div>
+      <a class="secondary button" href="/">返回上传页</a>
+    </div>
+    {message_html}
+    {error_html}
+    <section class="panel">
+      <form method="get" action="/preview">
+        <label>选择 Sheet
+          <select name="sheet">{sheet_options}</select>
+        </label>
+        <label>预览行数
+          <input name="rows" value="{rows_limit}" inputmode="numeric">
+        </label>
+        <button class="primary" type="submit">刷新预览</button>
+        <a class="secondary button" href="/download/latest">下载当前最新版</a>
+      </form>
+    </section>
+    <section class="panel">
+      <form method="post" action="/edit-cell">
+        <input type="hidden" name="sheet" value="{html.escape(selected_sheet)}">
+        <label>单元格
+          <input name="cell" placeholder="例如 BU25" required>
+        </label>
+        <label>新内容
+          <input name="value" placeholder="留空则清空该单元格">
+        </label>
+        <button class="primary" type="submit">保存修改</button>
+        <span class="subtext">提示：点击表格单元格时可在浏览器提示里看到坐标。</span>
+      </form>
+    </section>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>#</th>{header_cells}</tr></thead>
+        <tbody>{table_html}</tbody>
+      </table>
+    </div>
+  </main>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
+
+
+def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
+    try:
+        if job_is_running():
+            raise ValueError("当前有预测正在后台回填，请处理完成后再编辑表格。")
+        if not master_sales_exists():
+            raise ValueError("还没有共用销售排单可编辑，请先上传本周排单。")
+
+        content_length = int(handler.headers.get("Content-Length", "0") or "0")
+        body = handler.rfile.read(content_length).decode("utf-8")
+        form = urllib.parse.parse_qs(body, keep_blank_values=True)
+        sheet = (form.get("sheet", [""])[0] or "").strip()
+        cell = (form.get("cell", [""])[0] or "").strip().upper().replace(" ", "")
+        raw_value = form.get("value", [""])[0]
+
+        if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", cell):
+            raise ValueError("单元格格式不正确，请输入类似 BU25 的位置。")
+
+        with STATE_LOCK:
+            wb = load_workbook(MASTER_SALES_PATH)
+            try:
+                if sheet not in wb.sheetnames:
+                    raise ValueError(f"没有找到 Sheet：{sheet}")
+                ws = wb[sheet]
+                coordinate_to_tuple(cell)
+                ws[cell].value = parse_cell_edit_value(raw_value)
+                wb.save(MASTER_SALES_PATH)
+                shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+
+                metadata = ensure_metadata_schema(load_metadata())
+                metadata["last_manual_edit_at"] = now_label()
+                metadata["last_manual_edit_cell"] = f"{sheet}!{cell}"
+                save_metadata(metadata)
+            finally:
+                wb.close()
+
+        write_html(
+            handler,
+            200,
+            render_preview_page(message=f"已保存 {sheet}!{cell} 的修改。", selected_sheet=sheet).decode("utf-8"),
+            head=head,
+        )
+    except Exception as exc:  # noqa: BLE001
+        write_html(
+            handler,
+            400,
+            render_preview_page(error=f"保存失败：{exc}").decode("utf-8"),
+            head=head,
+        )
 
 
 def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
@@ -1096,7 +1323,8 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             selected_owner,
             state="running",
             updated_rows="",
-            updated_at=now_label(),
+            uploaded_at=now_label(),
+            updated_at="",
             prediction_name=safe_filename(pred_field.filename, "预测文件"),
             error="",
         )
@@ -1157,6 +1385,19 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_html(self, 200, render_page(handler=self, selected_owner=owner).decode("utf-8"))
             return
 
+        if path == "/preview":
+            selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
+            try:
+                rows_limit = int(query.get("rows", ["80"])[0])
+            except ValueError:
+                rows_limit = 80
+            write_html(
+                self,
+                200,
+                render_preview_page(selected_sheet=selected_sheet, rows_limit=rows_limit).decode("utf-8"),
+            )
+            return
+
         if path == "/healthz":
             write_text(self, 200, "ok")
             return
@@ -1175,6 +1416,8 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                     "last_generated_at": metadata.get("last_generated_at", ""),
                     "last_updated_rows": metadata.get("last_updated_rows", ""),
                     "owner_statuses": metadata.get("owner_statuses", default_owner_statuses()),
+                    "data_dir": str(DATA_DIR),
+                    "storage": storage_description(),
                 },
             )
             return
@@ -1207,6 +1450,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_text(self, 200, "ok", head=True)
             return
 
+        if path == "/preview":
+            write_html(self, 200, render_preview_page().decode("utf-8"), head=True)
+            return
+
         if path == "/status":
             write_json(self, 200, {"ok": True}, head=True)
             return
@@ -1226,6 +1473,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/sales-master":
             handle_sales_master(self)
+            return
+
+        if parsed.path == "/edit-cell":
+            handle_edit_cell(self)
             return
 
         if parsed.path != "/generate":
