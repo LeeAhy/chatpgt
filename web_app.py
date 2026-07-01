@@ -199,7 +199,8 @@ def remote_request(
     except urllib.error.HTTPError as exc:
         if exc.code == 404 and method == "GET":
             return None
-        raise RuntimeError(f"Netlify Blobs 请求失败：HTTP {exc.code}") from exc
+        error_body = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"Netlify Blobs 请求失败：HTTP {exc.code} {error_body}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"连接 Netlify Blobs 失败：{exc.reason}") from exc
 
