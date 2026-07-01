@@ -48,6 +48,7 @@ REMOTE_STORAGE_SECRET = os.environ.get("SALES_STORAGE_SECRET", "").strip()
 REMOTE_MASTER_KEY = "current_sales.xlsx"
 REMOTE_LATEST_KEY = "latest_generated.xlsx"
 REMOTE_METADATA_KEY = "metadata.json"
+REMOTE_CHUNK_SIZE = 2 * 1024 * 1024
 STATE_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 JOB_STATUS = {
@@ -208,16 +209,58 @@ def remote_request(
 def remote_put_file(key: str, path: Path, content_type: str = XLSX_MIME) -> None:
     if not remote_storage_enabled() or not path.exists():
         return
-    remote_request("PUT", key, path.read_bytes(), content_type=content_type)
+    file_size = path.stat().st_size
+    if file_size <= REMOTE_CHUNK_SIZE:
+        remote_request("PUT", key, path.read_bytes(), content_type=content_type)
+        return
+
+    chunk_keys = []
+    with path.open("rb") as source:
+        index = 0
+        while True:
+            chunk = source.read(REMOTE_CHUNK_SIZE)
+            if not chunk:
+                break
+            chunk_key = f"chunks/{key}/{index:05d}"
+            remote_request("PUT", chunk_key, chunk, content_type="application/octet-stream")
+            chunk_keys.append(chunk_key)
+            index += 1
+
+    remote_put_json(
+        f"manifests/{key}.json",
+        {
+            "key": key,
+            "content_type": content_type,
+            "size": file_size,
+            "chunk_size": REMOTE_CHUNK_SIZE,
+            "chunks": chunk_keys,
+            "updated_at": now_label(),
+        },
+    )
 
 
 def remote_get_file(key: str, path: Path) -> bool:
     if not remote_storage_enabled():
         return False
+
+    ensure_data_dir()
+    manifest_data = remote_request("GET", f"manifests/{key}.json")
+    if manifest_data is not None:
+        manifest = json.loads(manifest_data.decode("utf-8"))
+        chunk_keys = manifest.get("chunks") or []
+        if not chunk_keys:
+            return False
+        with path.open("wb") as out:
+            for chunk_key in chunk_keys:
+                chunk = remote_request("GET", str(chunk_key))
+                if chunk is None:
+                    return False
+                out.write(chunk)
+        return True
+
     data = remote_request("GET", key)
     if data is None:
         return False
-    ensure_data_dir()
     path.write_bytes(data)
     return True
 
