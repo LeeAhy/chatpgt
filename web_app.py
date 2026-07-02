@@ -246,24 +246,39 @@ def remote_get_file(key: str, path: Path) -> bool:
         return False
 
     ensure_data_dir()
+    temp_path = path.with_name(f".{path.name}.download")
+    expected_size: Optional[int] = None
     manifest_data = remote_request("GET", f"manifests/{key}.json")
     if manifest_data is not None:
         manifest = json.loads(manifest_data.decode("utf-8"))
         chunk_keys = manifest.get("chunks") or []
         if not chunk_keys:
             return False
-        with path.open("wb") as out:
+        expected_size = int(manifest.get("size") or 0) or None
+        with temp_path.open("wb") as out:
             for chunk_key in chunk_keys:
                 chunk = remote_request("GET", str(chunk_key))
                 if chunk is None:
+                    temp_path.unlink(missing_ok=True)
                     return False
                 out.write(chunk)
+        if expected_size is not None and temp_path.stat().st_size != expected_size:
+            temp_path.unlink(missing_ok=True)
+            raise RuntimeError("Netlify Blobs 里的 Excel 分片不完整，请重新上传共用销售排单。")
+        if key.lower().endswith((".xlsx", ".xlsm")) and not zipfile.is_zipfile(temp_path):
+            temp_path.unlink(missing_ok=True)
+            raise RuntimeError("Netlify Blobs 里的 Excel 文件不完整，请重新上传共用销售排单。")
+        temp_path.replace(path)
         return True
 
     data = remote_request("GET", key)
     if data is None:
         return False
-    path.write_bytes(data)
+    temp_path.write_bytes(data)
+    if key.lower().endswith((".xlsx", ".xlsm")) and not zipfile.is_zipfile(temp_path):
+        temp_path.unlink(missing_ok=True)
+        raise RuntimeError("Netlify Blobs 里的 Excel 文件不完整，请重新上传共用销售排单。")
+    temp_path.replace(path)
     return True
 
 
@@ -383,7 +398,9 @@ def safe_filename(value: str, default: str = "销售排单.xlsx") -> str:
 def master_sales_exists() -> bool:
     if not MASTER_SALES_PATH.exists() and remote_storage_enabled():
         hydrate_remote_state()
-    return MASTER_SALES_PATH.exists() and MASTER_SALES_PATH.stat().st_size > 0
+    if not MASTER_SALES_PATH.exists() or MASTER_SALES_PATH.stat().st_size <= 0:
+        return False
+    return zipfile.is_zipfile(MASTER_SALES_PATH)
 
 
 def storage_description() -> str:
@@ -968,8 +985,8 @@ def render_page(
           </div>
           <div>
             <label for="prediction_file">预测信息</label>
-            <input id="prediction_file" name="prediction_file" type="file" accept=".xlsx,.xlsm,.csv,.tsv,.txt,.png,.jpg,.jpeg,.webp,.heic,.tif,.tiff" required>
-            <div class="hint">支持 Excel、CSV、TXT；截图入口已接入，系统 OCR 可用时会自动识别。无需再上传销售排单。</div>
+            <input id="prediction_file" name="prediction_file" type="file" accept=".xlsx,.jpg,.jpeg,.png" required>
+            <div class="hint">支持 .xlsx、.jpg、.png；建议优先上传 .xlsx，清晰截图会按已适配规则识别。无需再上传销售排单。</div>
           </div>
           <div class="actions">
             <button class="primary" type="submit">开始回填</button>
@@ -1065,6 +1082,26 @@ def validate_excel_file(path: Path, label: str) -> None:
         wb.close()
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"{label}无法被 Excel 解析：{exc}") from exc
+
+
+def validate_prediction_file(path: Path, label: str) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".xlsx":
+        validate_excel_file(path, label)
+        return
+
+    if suffix in {".jpg", ".jpeg", ".png"}:
+        if not path.exists() or path.stat().st_size <= 0:
+            raise ValueError(f"{label}上传后为空文件，请重新选择原始图片上传。")
+        with path.open("rb") as f:
+            head = f.read(12)
+        is_png = suffix == ".png" and head.startswith(b"\x89PNG\r\n\x1a\n")
+        is_jpg = suffix in {".jpg", ".jpeg"} and head.startswith(b"\xff\xd8\xff")
+        if not (is_png or is_jpg):
+            raise ValueError(f"{label}不是标准 {suffix} 图片，请重新上传原始 jpg/png 截图。")
+        return
+
+    raise ValueError("预测信息请上传 .xlsx、.jpg 或 .png 文件。")
 
 
 def first_upload(form: cgi.FieldStorage, name: str):
@@ -1388,7 +1425,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                 ensure_data_dir()
                 shutil.copy2(MASTER_SALES_PATH, working_sales_path)
                 validate_excel_file(working_sales_path, "当前共用销售排单")
-            validate_excel_file(pred_path, f"{selected_owner} 的预测文件")
+            validate_prediction_file(pred_path, f"{selected_owner} 的预测文件")
 
             summary = process_sales_workbooks(
                 pred_path=pred_path,
@@ -1487,7 +1524,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
 
         pred_suffix = uploaded_suffix(pred_field.filename)
         if pred_suffix not in SUPPORTED_PREDICTION_SUFFIXES:
-            raise ValueError("预测信息请上传 Excel、CSV、TXT 或图片文件。")
+            raise ValueError("预测信息请上传 .xlsx、.jpg 或 .png 文件。")
         if not master_sales_exists():
             raise ValueError("请先在页面上方上传本周共用销售排单。")
         if job_is_running():
@@ -1497,7 +1534,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         pred_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
         pred_path = UPLOAD_DIR / pred_name
         save_upload(pred_field, pred_path)
-        validate_excel_file(pred_path, f"{selected_owner} 的预测文件")
+        validate_prediction_file(pred_path, f"{selected_owner} 的预测文件")
         update_owner_status(
             selected_owner,
             state="running",

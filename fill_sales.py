@@ -32,11 +32,12 @@ OUT_DIR = Path("/Users/chandelar/Documents/销售排单/outputs/sales_fill_0602"
 OUT_PATH = OUT_DIR / "2026年第一事业部销售排单-0602_已回填.xlsx"
 
 BUSINESS_OWNERS = ("王永仁", "周文龙", "洪鸣", "叶振华", "李玎玲", "李海鹰")
-EXCEL_SUFFIXES = {".xlsx", ".xlsm"}
-TEXT_SUFFIXES = {".csv", ".tsv", ".txt"}
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".heic", ".tif", ".tiff"}
-SUPPORTED_PREDICTION_SUFFIXES = EXCEL_SUFFIXES | TEXT_SUFFIXES | IMAGE_SUFFIXES
-SUPPORTED_SALES_SUFFIXES = EXCEL_SUFFIXES
+EXCEL_SUFFIXES = {".xlsx"}
+SALES_EXCEL_SUFFIXES = {".xlsx", ".xlsm"}
+TEXT_SUFFIXES: set[str] = set()
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
+SUPPORTED_PREDICTION_SUFFIXES = EXCEL_SUFFIXES | IMAGE_SUFFIXES
+SUPPORTED_SALES_SUFFIXES = SALES_EXCEL_SUFFIXES
 
 HEADER_SCAN_ROWS = 12
 DATA_START_ROW = 5
@@ -781,7 +782,7 @@ def compile_ocr_helper() -> Path:
 
     clang = shutil.which("clang")
     if not clang:
-        raise RuntimeError("当前电脑没有 clang，无法启用截图识别。请先上传 Excel/CSV 表格文件。")
+        raise RuntimeError("当前环境无法启用截图识别。请先上传 .xlsx 预测文件，或上传已专门适配格式的清晰截图。")
 
     env = os.environ.copy()
     env["CLANG_MODULE_CACHE_PATH"] = str(Path(tempfile.gettempdir()) / "clang-module-cache")
@@ -817,7 +818,7 @@ def run_ocr(pred_path: Path) -> list[OcrToken]:
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         if not detail or "Vision request failed" in detail:
-            raise RuntimeError("当前运行环境无法调用系统图片识别，请先上传 Excel、CSV 或 TXT 预测文件。")
+            raise RuntimeError("当前运行环境无法调用系统图片识别，请先上传 .xlsx 预测文件，或上传已专门适配格式的清晰截图。")
         raise RuntimeError(f"图片识别失败：{detail}")
 
     tokens: list[OcrToken] = []
@@ -1153,7 +1154,7 @@ def build_predictions(
         return build_predictions_from_text_file(pred_path, sales_codes, business_owner, current_month)
     if suffix in IMAGE_SUFFIXES:
         return build_predictions_from_image(pred_path, sales_codes, business_owner)
-    raise ValueError("预测信息请上传 .xlsx/.xlsm/.csv/.tsv/.txt 或图片文件。")
+    raise ValueError("预测信息请上传 .xlsx、.jpg 或 .png 文件。")
 
 
 def build_price_sources(sales_values_wb):
