@@ -14,6 +14,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -90,6 +91,7 @@ def get_lan_ip() -> str:
         except Exception:
             pass
 
+    backup_path: Optional[Path] = None
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.connect(("8.8.8.8", 80))
@@ -1045,6 +1047,26 @@ def save_upload(field: cgi.FieldStorage, dest: Path) -> None:
         shutil.copyfileobj(field.file, out)
 
 
+def validate_excel_file(path: Path, label: str) -> None:
+    suffix = path.suffix.lower()
+    if suffix not in {".xlsx", ".xlsm"}:
+        return
+    if not path.exists() or path.stat().st_size <= 0:
+        raise ValueError(f"{label}上传后为空文件，请重新选择原始 Excel 文件上传。")
+    if not zipfile.is_zipfile(path):
+        with path.open("rb") as f:
+            head = f.read(16).hex(" ")
+        raise ValueError(
+            f"{label}不是标准 Excel 文件，网站无法读取。"
+            f"请重新上传原始 .xlsx/.xlsm 文件（当前大小 {format_file_size(path)}，文件头 {head or '空'}）。"
+        )
+    try:
+        wb = load_workbook(path, read_only=True, data_only=True)
+        wb.close()
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{label}无法被 Excel 解析：{exc}") from exc
+
+
 def first_upload(form: cgi.FieldStorage, name: str):
     field = form[name]
     if isinstance(field, list):
@@ -1302,8 +1324,10 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
             ensure_data_dir()
             if master_sales_exists():
                 backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + MASTER_SALES_PATH.name
-                shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
+                backup_path = BACKUP_DIR / backup_name
+                shutil.copy2(MASTER_SALES_PATH, backup_path)
             save_upload(sales_field, MASTER_SALES_PATH)
+            validate_excel_file(MASTER_SALES_PATH, "共用销售排单")
             shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
             sync_master_files_to_remote()
             save_metadata(
@@ -1328,6 +1352,12 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
             head=head,
         )
     except Exception as exc:  # noqa: BLE001
+        if backup_path and backup_path.exists():
+            try:
+                shutil.copy2(backup_path, MASTER_SALES_PATH)
+                shutil.copy2(backup_path, LATEST_OUTPUT_PATH)
+            except Exception:
+                pass
         write_html(
             handler,
             400,
@@ -1357,6 +1387,8 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                     raise ValueError("共用销售排单不存在，请先重新上传本周排单。")
                 ensure_data_dir()
                 shutil.copy2(MASTER_SALES_PATH, working_sales_path)
+                validate_excel_file(working_sales_path, "当前共用销售排单")
+            validate_excel_file(pred_path, f"{selected_owner} 的预测文件")
 
             summary = process_sales_workbooks(
                 pred_path=pred_path,
@@ -1465,6 +1497,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         pred_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
         pred_path = UPLOAD_DIR / pred_name
         save_upload(pred_field, pred_path)
+        validate_excel_file(pred_path, f"{selected_owner} 的预测文件")
         update_owner_status(
             selected_owner,
             state="running",
