@@ -14,7 +14,7 @@ from datetime import date, datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from statistics import median
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 from runtime_bootstrap import ensure_bundled_python_path
 
@@ -1391,7 +1391,28 @@ def process_sales_workbooks(
     freeze_formulas: bool = True,
     business_owner: Optional[str] = None,
     as_of_date: Optional[date] = None,
+    progress_callback: Optional[Callable[[dict], None]] = None,
 ):
+    def report_progress(percent: int, step: str, target: Optional[FillTarget] = None) -> None:
+        if progress_callback is None:
+            return
+        payload = {
+            "percent": max(0, min(100, int(percent))),
+            "step": step,
+        }
+        if target is not None:
+            payload.update(
+                {
+                    "target_sheet": target.sheet,
+                    "target_label": target.label,
+                    "target_month": target.month,
+                }
+            )
+        try:
+            progress_callback(payload)
+        except Exception:
+            pass
+
     pred_path = Path(pred_path)
     sales_path = Path(sales_path)
     output_path = Path(output_path)
@@ -1399,13 +1420,16 @@ def process_sales_workbooks(
 
     # Keep Render/free-server memory low: first read cached values for matching
     # and price sources, release that workbook, then open the editable workbook.
+    report_progress(5, "读取共用销售排单")
     sales_values_wb = load_workbook(sales_path, read_only=False, data_only=True)
+    report_progress(12, "读取销售排单客户机种")
     sales_codes = collect_sales_codes(sales_values_wb, business_owner=business_owner)
     if not sales_codes:
         owner_note = f"（业务担当：{business_owner}）" if business_owner else ""
         sales_values_wb.close()
         del sales_values_wb
         gc.collect()
+        report_progress(90, "没有找到可匹配客户机种，生成未改动文件")
         sales_wb = load_workbook(sales_path)
         return unchanged_summary(
             sales_wb,
@@ -1416,16 +1440,19 @@ def process_sales_workbooks(
             f"销售排单里没有找到可匹配的客户机种{owner_note}，已生成未改动文件。",
         )
 
+    report_progress(22, "读取业务预测文件")
     predictions = build_predictions(
         pred_path,
         sales_codes,
         business_owner=business_owner,
         as_of_date=as_of_date,
     )
+    report_progress(32, "匹配预测机种与销售排单客户机种")
     if not predictions:
         sales_values_wb.close()
         del sales_values_wb
         gc.collect()
+        report_progress(90, "没有识别到可用预测，生成未改动文件")
         sales_wb = load_workbook(sales_path)
         return unchanged_summary(
             sales_wb,
@@ -1441,13 +1468,16 @@ def process_sales_workbooks(
         for target in select_latest_fill_targets(find_fill_targets(sales_values_wb))
         if target.month >= as_of_date.month
     ]
+    report_progress(40, f"识别销售排单预估空白栏：{len(fill_targets)} 个")
     previous_estimate_values = build_previous_estimate_cache(sales_values_wb, fill_targets)
     sales_values_wb.close()
     del sales_values_wb
     gc.collect()
 
+    report_progress(45, "打开可编辑销售排单")
     sales_wb = load_workbook(sales_path)
     if not fill_targets:
+        report_progress(90, "没有找到可回填预估空白栏，生成未改动文件")
         return unchanged_summary(
             sales_wb,
             output_path,
@@ -1466,7 +1496,10 @@ def process_sales_workbooks(
     zero_filled_rows = []
     warnings = []
 
-    for target in fill_targets:
+    total_targets = max(len(fill_targets), 1)
+    for target_index, target in enumerate(fill_targets, start=1):
+        progress_percent = 45 + int((target_index - 1) / total_targets * 40)
+        report_progress(progress_percent, "按预估空白栏回填数量和金额", target)
         if not any(month_map.get(target.month) is not None for month_map in predictions.values()):
             skipped_months.append((target.sheet, target.label, target.month))
 
@@ -1617,7 +1650,9 @@ def process_sales_workbooks(
         calc.fullCalcOnLoad = True
         calc.forceFullCalc = True
 
+    report_progress(88, "保存共用销售排单最新版")
     save_sales_workbook(sales_wb, output_path, freeze_formulas)
+    report_progress(96, "整理回填结果")
 
     summary = {
         "output_path": output_path,

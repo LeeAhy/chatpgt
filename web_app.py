@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -38,6 +39,7 @@ UPLOAD_MIME = "multipart/form-data"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 PUBLIC_URL_ENV_VARS = ("PUBLIC_URL", "RENDER_EXTERNAL_URL", "APP_URL", "SITE_URL")
 DEFAULT_OWNER = BUSINESS_OWNERS[0]
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 DATA_DIR = Path(os.environ.get("SALES_DATA_DIR", "/data/sales-upload" if Path("/data").exists() else "server_data"))
 MASTER_SALES_PATH = DATA_DIR / "current_sales.xlsx"
 LATEST_OUTPUT_PATH = DATA_DIR / "latest_generated.xlsx"
@@ -60,6 +62,9 @@ JOB_STATUS = {
     "finished_at": "",
     "updated_rows": "",
     "error": "",
+    "progress": "0",
+    "step": "",
+    "target": "",
 }
 OWNER_GUIDES = {
     "洪鸣": "读取预测文件中的 New part NO 匹配销售排单“客户机种”。",
@@ -329,6 +334,7 @@ def default_owner_statuses() -> dict[str, dict[str, str]]:
         owner: {
             "state": "pending",
             "updated_rows": "",
+            "progress": "",
             "updated_at": "",
             "uploaded_at": "",
             "prediction_name": "",
@@ -386,8 +392,20 @@ def job_is_running() -> bool:
     return get_job_status().get("state") == "running"
 
 
+def format_progress(value) -> str:
+    try:
+        percent = int(float(value))
+    except (TypeError, ValueError):
+        percent = 0
+    return str(max(0, min(100, percent)))
+
+
+def beijing_now() -> datetime:
+    return datetime.now(BEIJING_TZ)
+
+
 def now_label() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return beijing_now().strftime("%Y-%m-%d %H:%M:%S 北京时间")
 
 
 def safe_filename(value: str, default: str = "销售排单.xlsx") -> str:
@@ -499,7 +517,11 @@ def render_page(
     for owner in BUSINESS_OWNERS:
         status = owner_statuses.get(owner, {})
         state = status.get("state", "pending")
-        row_text = f'{html.escape(status.get("updated_rows", ""))} 行' if status.get("updated_rows") else "等待预测"
+        progress_text = format_progress(status.get("progress")) if status.get("progress") else ""
+        if state == "running" and progress_text:
+            row_text = f"处理中 {html.escape(progress_text)}%"
+        else:
+            row_text = f'{html.escape(status.get("updated_rows", ""))} 行' if status.get("updated_rows") else "等待预测"
         prediction_name = status.get("prediction_name") or "暂无上传记录"
         uploaded_at = status.get("uploaded_at") or status.get("updated_at") or ""
         done_at = status.get("updated_at") or ""
@@ -519,11 +541,18 @@ def render_page(
     job_state = job.get("state", "idle")
     refresh_url = owner_link(selected_owner)
     if job_state == "running":
+        progress = format_progress(job.get("progress"))
+        step = job.get("step") or job.get("message") or "正在处理"
+        target_text = job.get("target") or ""
         job_html = (
-            f'<div class="notice working" role="status">正在处理：{html.escape(job.get("owner", ""))} 的预测，'
-            f'开始时间：{html.escape(job.get("started_at", ""))}。处理完成前请不要重复上传。</div>'
+            f'<div class="notice working" role="status">'
+            f'<div>正在处理：{html.escape(job.get("owner", ""))} 的预测，进度 {html.escape(progress)}%。'
+            f'当前步骤：{html.escape(step)}{(" ｜ " + html.escape(target_text)) if target_text else ""}。</div>'
+            f'<div class="progress-track" aria-label="处理进度"><span style="width: {html.escape(progress)}%"></span></div>'
+            f'<div class="progress-note">开始时间：{html.escape(job.get("started_at", ""))}。处理完成前请不要重复上传。</div>'
+            f'</div>'
         )
-        refresh_meta = f'<meta http-equiv="refresh" content="15; url={html.escape(refresh_url)}">'
+        refresh_meta = f'<meta http-equiv="refresh" content="5; url={html.escape(refresh_url)}">'
     elif job_state == "done":
         job_html = (
             f'<div class="notice success" role="status">最近处理完成：{html.escape(job.get("owner", ""))}，'
@@ -706,6 +735,26 @@ def render_page(
       background: #fff8e6;
       border-color: #efd596;
       color: var(--warn);
+    }}
+    .progress-track {{
+      height: 10px;
+      margin-top: 10px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: rgba(138, 88, 0, 0.16);
+    }}
+    .progress-track span {{
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #136f63, #d18b00);
+      transition: width 0.25s ease;
+    }}
+    .progress-note {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 600;
     }}
     .notice.error {{
       background: #fff0ee;
@@ -921,7 +970,7 @@ def render_page(
     <section class="topline">
       <div>
         <h1>销售排单回填工作台</h1>
-        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测，系统会按机种分别补充 6/29预估（7月）、6/29预估（8月）等每个月的预估数量和金额。</p>
+        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；系统会自动扫描销售排单里当前空白的“预估”数量/金额栏，并按栏位对应的月份匹配预测文件中的月份数量后回填。</p>
       </div>
       <div class="access">{html.escape(access_note)}</div>
     </section>
@@ -974,7 +1023,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>当月会自动扣减同一客户机种已完成数量；后续月份按对应月份预估栏回填。每次回填都会保存为共用排单最新版。</span>
+            <span>系统会以销售排单上的预估栏为准：例如本周是 6/29预估（7月/8月/9月/10月），下周变成 7/6预估时也会自动识别；当月会扣减同一客户机种已完成数量，每次回填都会保存为共用排单最新版。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -1360,7 +1409,7 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
         with STATE_LOCK:
             ensure_data_dir()
             if master_sales_exists():
-                backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + MASTER_SALES_PATH.name
+                backup_name = beijing_now().strftime("%Y%m%d_%H%M%S") + "_" + MASTER_SALES_PATH.name
                 backup_path = BACKUP_DIR / backup_name
                 shutil.copy2(MASTER_SALES_PATH, backup_path)
             save_upload(sales_field, MASTER_SALES_PATH)
@@ -1404,6 +1453,20 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
 
 
 def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
+    def progress_callback(progress: dict) -> None:
+        target_parts = []
+        if progress.get("target_sheet"):
+            target_parts.append(str(progress["target_sheet"]))
+        if progress.get("target_label"):
+            target_parts.append(str(progress["target_label"]))
+        if progress.get("target_month"):
+            target_parts.append(f'{progress["target_month"]}月')
+        set_job_status(
+            progress=format_progress(progress.get("percent")),
+            step=str(progress.get("step") or ""),
+            target=" / ".join(target_parts),
+        )
+
     set_job_status(
         state="running",
         owner=selected_owner,
@@ -1412,6 +1475,9 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
         finished_at="",
         updated_rows="",
         error="",
+        progress="1",
+        step="准备处理上传文件",
+        target="",
     )
     try:
         with tempfile.TemporaryDirectory(prefix="sales_job_") as tmp_dir:
@@ -1422,6 +1488,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
             with STATE_LOCK:
                 if not master_sales_exists():
                     raise ValueError("共用销售排单不存在，请先重新上传本周排单。")
+                set_job_status(progress="3", step="复制当前共用销售排单", target="")
                 ensure_data_dir()
                 shutil.copy2(MASTER_SALES_PATH, working_sales_path)
                 validate_excel_file(working_sales_path, "当前共用销售排单")
@@ -1436,15 +1503,18 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                 # request time out, so the website keeps formulas live.
                 freeze_formulas=False,
                 business_owner=selected_owner,
+                progress_callback=progress_callback,
             )
 
             with STATE_LOCK:
                 if not master_sales_exists():
                     raise ValueError("共用销售排单不存在，请先重新上传本周排单。")
-                backup_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}_before.xlsx"
+                set_job_status(progress="97", step="备份并替换共用销售排单", target="")
+                backup_name = beijing_now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}_before.xlsx"
                 shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
                 shutil.copy2(output_path, MASTER_SALES_PATH)
                 shutil.copy2(output_path, LATEST_OUTPUT_PATH)
+                set_job_status(progress="98", step="同步保存共享网站数据", target="")
                 sync_master_files_to_remote()
 
                 metadata = load_metadata()
@@ -1464,6 +1534,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                     {
                         "state": "done",
                         "updated_rows": str(summary["updated_rows"]),
+                        "progress": "100",
                         "updated_at": now_label(),
                         "error": "",
                     }
@@ -1477,6 +1548,9 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
             finished_at=now_label(),
             updated_rows=summary["updated_rows"],
             error="",
+            progress="100",
+            step="处理完成",
+            target="",
         )
     except Exception as exc:  # noqa: BLE001
         set_job_status(
@@ -1486,11 +1560,14 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
             finished_at=now_label(),
             updated_rows="",
             error=str(exc),
+            progress=format_progress(get_job_status().get("progress")),
+            step="处理失败",
         )
         update_owner_status(
             selected_owner,
             state="error",
             updated_rows="",
+            progress=format_progress(get_job_status().get("progress")),
             updated_at=now_label(),
             error=str(exc),
         )
@@ -1531,7 +1608,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             raise ValueError("上一份预测还在处理，请稍后刷新页面，完成后再上传下一位业务预测。")
 
         ensure_data_dir()
-        pred_name = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
+        pred_name = beijing_now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
         pred_path = UPLOAD_DIR / pred_name
         save_upload(pred_field, pred_path)
         validate_prediction_file(pred_path, f"{selected_owner} 的预测文件")
@@ -1539,6 +1616,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             selected_owner,
             state="running",
             updated_rows="",
+            progress="1",
             uploaded_at=now_label(),
             updated_at="",
             prediction_name=safe_filename(pred_field.filename, "预测文件"),
@@ -1552,6 +1630,9 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             finished_at="",
             updated_rows="",
             error="",
+            progress="1",
+            step="已收到预测文件，等待后台处理",
+            target="",
         )
 
         worker = threading.Thread(
