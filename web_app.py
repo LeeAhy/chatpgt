@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import cgi
+import hashlib
 import html
 import json
 from functools import lru_cache
@@ -498,9 +499,7 @@ def render_page(
         '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
     )
     preview_latest_html = (
-        '<a class="secondary button" href="/preview?full=1">在线预览/编辑整本表格</a>'
-        if has_master
-        else ""
+        '<a class="secondary button" href="/preview">打开 xlsx 编辑器</a>' if has_master else ""
     )
     state_text = (
         f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
@@ -1585,6 +1584,263 @@ def fill_css_from_cell(cell) -> str:
     return f"#{red:02x}{green:02x}{blue:02x}"
 
 
+def onlyoffice_document_server_url() -> str:
+    return normalize_base_url(os.environ.get("ONLYOFFICE_DOCUMENT_SERVER_URL", "https://documentserver.onlyoffice.com"))
+
+
+def onlyoffice_public_base_url(handler: Optional[BaseHTTPRequestHandler] = None) -> Optional[str]:
+    return get_public_share_url(handler)
+
+
+def onlyoffice_document_key() -> str:
+    metadata = ensure_metadata_schema(load_metadata()) if METADATA_PATH.exists() else {}
+    parts = [MASTER_SALES_PATH.name]
+    if MASTER_SALES_PATH.exists():
+        stat = MASTER_SALES_PATH.stat()
+        parts.extend([str(stat.st_size), str(stat.st_mtime_ns)])
+    parts.extend(
+        [
+            str(metadata.get("latest_name", "")),
+            str(metadata.get("last_generated_at", "")),
+            str(metadata.get("last_owner", "")),
+        ]
+    )
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+
+def onlyoffice_document_url(handler: Optional[BaseHTTPRequestHandler] = None) -> str:
+    public_base = onlyoffice_public_base_url(handler)
+    return f"{public_base}/download/latest" if public_base else ""
+
+
+def onlyoffice_callback_url(handler: Optional[BaseHTTPRequestHandler] = None) -> str:
+    public_base = onlyoffice_public_base_url(handler)
+    return f"{public_base}/api/onlyoffice/callback" if public_base else ""
+
+
+def render_onlyoffice_page(
+    message: str = "",
+    error: str = "",
+    handler: Optional[BaseHTTPRequestHandler] = None,
+) -> bytes:
+    if not master_sales_exists():
+        return render_page(error="还没有共用销售排单可打开，请先上传本周排单。", handler=handler)
+
+    public_base = onlyoffice_public_base_url(handler)
+    if not public_base:
+        return render_page(
+            error="OnlyOffice 需要一个公网可访问的网址才能打开和保存。请用 Render 的正式域名访问该页面。",
+            handler=handler,
+        )
+
+    docs_server = onlyoffice_document_server_url()
+    if not docs_server:
+        return render_page(error="未配置 OnlyOffice 文档服务器地址。", handler=handler)
+
+    metadata = ensure_metadata_schema(load_metadata())
+    latest_name = metadata.get("latest_name") or metadata.get("master_name") or "当前最新版.xlsx"
+    doc_url = onlyoffice_document_url(handler)
+    callback_url = onlyoffice_callback_url(handler)
+    document_key = onlyoffice_document_key()
+    config = {
+        "documentType": "cell",
+        "document": {
+            "fileType": "xlsx",
+            "key": document_key,
+            "title": latest_name,
+            "url": doc_url,
+        },
+        "editorConfig": {
+            "mode": "edit",
+            "lang": "zh-CN",
+            "callbackUrl": callback_url,
+            "user": {
+                "id": "shared-sales-workbook",
+                "name": "共享排单",
+            },
+        },
+        "permissions": {
+            "comment": False,
+            "download": True,
+            "edit": True,
+            "print": True,
+            "review": False,
+            "fillForms": True,
+            "copy": True,
+        },
+        "customization": {
+            "autosave": True,
+            "forcesave": True,
+            "toolbarNoTabs": False,
+            "compactToolbar": False,
+        },
+    }
+    editor_config_json = json.dumps(config, ensure_ascii=False)
+    docs_js_url = f"{docs_server}/web-apps/apps/api/documents/api.js"
+    page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>共用销售排单 xlsx 编辑器</title>
+  <style>
+    :root {{
+      --paper: #f3f6f1;
+      --panel: #ffffff;
+      --line: #d7e0d8;
+      --text: #17211b;
+      --muted: #5e6b63;
+      --accent: #136f63;
+      --accent-dark: #0c4f47;
+      --danger: #b42318;
+      --shadow: 0 16px 34px rgba(28, 43, 34, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: var(--text);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+      background:
+        linear-gradient(90deg, rgba(19, 111, 99, 0.06) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(138, 88, 0, 0.05) 1px, transparent 1px),
+        var(--paper);
+      background-size: 30px 30px;
+    }}
+    .shell {{
+      width: min(1600px, calc(100% - 28px));
+      margin: 0 auto;
+      padding: 18px 0 24px;
+    }}
+    .top {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: flex-start;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 26px;
+      line-height: 1.2;
+    }}
+    .subtext {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+    }}
+    .meta {{
+      max-width: 420px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      text-align: right;
+    }}
+    .notice {{
+      margin: 0 0 12px;
+      padding: 12px 14px;
+      border-radius: 8px;
+      line-height: 1.6;
+      font-weight: 800;
+    }}
+    .notice.success {{
+      color: var(--accent);
+      background: #e7f4ef;
+      border: 1px solid #bcdccd;
+    }}
+    .notice.error {{
+      color: var(--danger);
+      background: #fff0ee;
+      border: 1px solid #f3c3bd;
+    }}
+    .editor-shell {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }}
+    #onlyoffice-editor {{
+      width: 100%;
+      height: calc(100vh - 220px);
+      min-height: 760px;
+      background: #fff;
+    }}
+    .hint {{
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="top">
+      <div>
+        <h1>共用销售排单 xlsx 编辑器</h1>
+        <p class="subtext">这里直接打开并编辑原始 xlsx 文件。保存后会自动回写到当前共用排单，不会转换成别的格式。</p>
+      </div>
+      <div class="meta">
+        <div>当前文件：{html.escape(latest_name)}</div>
+        <div>文件地址：{html.escape(doc_url)}</div>
+        <div>保存回调：{html.escape(callback_url)}</div>
+      </div>
+    </section>
+
+    {f'<div class="notice success">{html.escape(message)}</div>' if message else ""}
+    {f'<div class="notice error">{html.escape(error)}</div>' if error else ""}
+
+    <section class="editor-shell">
+      <div id="onlyoffice-editor"></div>
+    </section>
+
+    <div class="hint">如果编辑器无法显示，请确认当前网站是通过 Render 的公网地址打开，而不是本机 127.0.0.1。</div>
+  </main>
+  <script>
+    const config = {editor_config_json};
+    const docsScriptUrl = {json.dumps(docs_js_url, ensure_ascii=False)};
+    const editorContainerId = "onlyoffice-editor";
+
+    function showError(text) {{
+      const host = document.getElementById(editorContainerId);
+      if (!host) return;
+      const box = document.createElement("div");
+      box.style.padding = "24px";
+      box.style.color = "#b42318";
+      box.style.fontWeight = "700";
+      box.style.lineHeight = "1.6";
+      box.textContent = String(text);
+      host.replaceChildren(box);
+    }}
+
+    const script = document.createElement("script");
+    script.src = docsScriptUrl;
+    script.onload = () => {{
+      if (!window.DocsAPI || !window.DocsAPI.DocEditor) {{
+        showError("OnlyOffice 编辑器脚本已加载，但未找到 DocEditor。");
+        return;
+      }}
+      try {{
+        new window.DocsAPI.DocEditor(editorContainerId, config);
+      }} catch (err) {{
+        console.error(err);
+        showError(err && err.message ? err.message : "OnlyOffice 编辑器初始化失败。");
+      }}
+    }};
+    script.onerror = () => {{
+      showError("无法加载 OnlyOffice 编辑器脚本，请检查文档服务器地址是否正确。");
+    }};
+    document.head.appendChild(script);
+  </script>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
+
+
 def editor_window_payload(
     wb,
     sheet_name: str,
@@ -1655,6 +1911,8 @@ def render_workbook_editor_page(
     cols_limit: int = 40,
     full_view: bool = False,
 ) -> bytes:
+    return render_onlyoffice_page(message=message, error=error)
+
     if not master_sales_exists():
         return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
 
@@ -2412,6 +2670,56 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
         )
 
 
+def handle_onlyoffice_callback(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
+    try:
+        payload = read_json_body(handler)
+        status = payload.get("status")
+        try:
+            status = int(status)
+        except (TypeError, ValueError):
+            status = None
+
+        callback_url = onlyoffice_callback_url(handler)
+        if not callback_url:
+            raise ValueError("无法确定回传地址。")
+
+        if status in {2, 6}:
+            download_url = (payload.get("url") or "").strip()
+            if not download_url:
+                raise ValueError("OnlyOffice 回调缺少文件下载地址。")
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                with urllib.request.urlopen(download_url, timeout=180) as response:
+                    shutil.copyfileobj(response, tmp_file)
+            try:
+                if not zipfile.is_zipfile(tmp_path):
+                    raise ValueError("OnlyOffice 返回的文件不是有效的 xlsx。")
+
+                with STATE_LOCK:
+                    ensure_data_dir()
+                    if MASTER_SALES_PATH.exists():
+                        backup_name = "onlyoffice_" + beijing_now().strftime("%Y%m%d_%H%M%S") + ".xlsx"
+                        shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
+                    shutil.copy2(tmp_path, MASTER_SALES_PATH)
+                    shutil.copy2(tmp_path, LATEST_OUTPUT_PATH)
+                    sync_master_files_to_remote()
+                    metadata = ensure_metadata_schema(load_metadata())
+                    metadata["latest_name"] = metadata.get("latest_name") or metadata.get("master_name") or "当前最新版.xlsx"
+                    metadata["last_owner"] = "在线编辑"
+                    metadata["last_generated_at"] = now_label()
+                    metadata["last_updated_rows"] = "整本表格"
+                    save_metadata(metadata)
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        write_json(handler, 200, {"error": 0}, head=head)
+    except Exception as exc:  # noqa: BLE001
+        write_json(handler, 200, {"error": 1, "message": str(exc)}, head=head)
+
+
 def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
     if handler.headers.get_content_type() != UPLOAD_MIME:
         write_html(
@@ -2754,6 +3062,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             handle_editor_window(self)
             return
 
+        if path == "/api/onlyoffice/callback":
+            handle_onlyoffice_callback(self)
+            return
+
         if path == "/healthz":
             write_text(self, 200, "ok")
             return
@@ -2841,6 +3153,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             handle_editor_window(self, head=True)
             return
 
+        if path == "/api/onlyoffice/callback":
+            write_text(self, 404, "Not found", head=True)
+            return
+
         if path == "/status":
             write_json(self, 200, {"ok": True}, head=True)
             return
@@ -2860,6 +3176,9 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/editor/save":
             handle_editor_save(self)
+            return
+        if parsed.path == "/api/onlyoffice/callback":
+            handle_onlyoffice_callback(self)
             return
         if parsed.path == "/sales-master":
             handle_sales_master(self)
