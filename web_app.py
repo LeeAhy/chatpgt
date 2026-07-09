@@ -498,7 +498,9 @@ def render_page(
         '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
     )
     preview_latest_html = (
-        '<a class="secondary button" href="/preview">在线预览</a>' if has_master else ""
+        '<a class="secondary button" href="/preview?full=1">在线预览/编辑整本表格</a>'
+        if has_master
+        else ""
     )
     state_text = (
         f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
@@ -1337,6 +1339,7 @@ def render_preview_page(
     start_col: int = 1,
     rows_limit: int = 80,
     cols_limit: int = 140,
+    full_view: bool = False,
 ) -> bytes:
     if not master_sales_exists():
         return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
@@ -1360,14 +1363,35 @@ def render_preview_page(
             selected_sheet = sheet_names[0]
         ws = wb[selected_sheet]
         editable_columns = editable_forecast_columns(wb, selected_sheet)
+        sheet_max_row = max(int(ws.max_row or 1), 1)
+        sheet_max_col = max(int(ws.max_column or 1), 1)
+        if full_view:
+            start_row = 1
+            start_col = 1
+            rows_limit = sheet_max_row
+            cols_limit = sheet_max_col
+            max_row = sheet_max_row
+            max_col = sheet_max_col
+        else:
+            start_row = min(start_row, sheet_max_row)
+            start_col = min(start_col, sheet_max_col)
+            max_row = min(sheet_max_row, start_row + rows_limit - 1)
+            max_col = min(sheet_max_col, start_col + cols_limit - 1)
         editable_labels = sorted(set(editable_columns.values()))
         editable_summary = "、".join(editable_labels[:8])
         if len(editable_labels) > 8:
             editable_summary += f" 等 {len(editable_labels)} 类"
         if not editable_summary:
             editable_summary = "当前 Sheet 没有识别到可在线修改的本周预估栏"
-        max_row = min(ws.max_row, start_row + rows_limit - 1)
-        max_col = min(ws.max_column, start_col + cols_limit - 1)
+        sheet_tab_html = "\n".join(
+            (
+                f'<a class="sheet-tab {"active" if name == selected_sheet else ""}" '
+                f'href="/preview?sheet={urllib.parse.quote(name)}&start_row={start_row}&start_col={get_column_letter(start_col)}'
+                f'&rows={rows_limit}&cols={cols_limit}{"&full=1" if full_view else ""}">'
+                f'{html.escape(name)}</a>'
+            )
+            for name in sheet_names
+        )
         sheet_options = "\n".join(
             f'<option value="{html.escape(name)}" {"selected" if name == selected_sheet else ""}>{html.escape(name)}</option>'
             for name in sheet_names
@@ -1396,6 +1420,7 @@ def render_preview_page(
                         f'<input type="hidden" name="start_col" value="{start_col}">'
                         f'<input type="hidden" name="rows" value="{rows_limit}">'
                         f'<input type="hidden" name="cols" value="{cols_limit}">'
+                        f'<input type="hidden" name="full" value="{1 if full_view else 0}">'
                         f'<input class="cell-input" name="value" value="{html.escape(display)}" '
                         f'aria-label="{html.escape(coord)}">'
                         '<button class="cell-save" type="submit">保存</button>'
@@ -1453,6 +1478,29 @@ def render_preview_page(
     th, td {{ border: 1px solid #d7ddd4; padding: 5px 7px; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }}
     th {{ position: sticky; top: 0; background: #e8efe9; z-index: 1; }}
     tr th:first-child {{ position: sticky; left: 0; z-index: 2; background: #e8efe9; }}
+    .sheet-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }}
+    .sheet-tab {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #bdd9cd;
+      background: #eef6f1;
+      color: #0c4f47;
+      text-decoration: none;
+      font-weight: 800;
+    }}
+    .sheet-tab.active {{
+      background: #136f63;
+      color: #fff;
+      border-color: #136f63;
+    }}
     .editable-cell {{ background: #e4f2ec; padding: 2px; }}
     .cell-form {{ display: flex; flex-wrap: nowrap; gap: 3px; align-items: center; }}
     .cell-input {{
@@ -1478,7 +1526,7 @@ def render_preview_page(
     <div class="top">
       <div>
         <h1>在线预览当前最新版</h1>
-        <p class="subtext">当前文件：{html.escape(latest_name)}。整张表可查看和下载；只有系统识别出的本周预估数量/金额栏可以在线修改，原始数据列不可修改。</p>
+        <p class="subtext">当前文件：{html.escape(latest_name)}。可以整张表查看和下载；系统仍只允许修改浅绿色可回填栏，原始黄底和历史数据列保持只读。</p>
       </div>
       <a class="secondary button" href="/">返回上传页</a>
     </div>
@@ -1501,12 +1549,16 @@ def render_preview_page(
         <label>预览列数
           <input name="cols" value="{cols_limit}" inputmode="numeric">
         </label>
+        <input type="hidden" name="full" value="{1 if full_view else 0}">
         <button class="primary" type="submit">刷新预览</button>
         <a class="secondary button" href="/download/latest">下载当前最新版</a>
+        <a class="secondary button" href="/preview?sheet={urllib.parse.quote(selected_sheet)}&full=1">整表模式</a>
+        <a class="secondary button" href="/preview?sheet={urllib.parse.quote(selected_sheet)}&start_row=1&start_col=A&rows=80&cols=140">窗口模式</a>
       </form>
     </section>
     <section class="panel">
-      <p class="subtext">可在线修改范围：{html.escape(editable_summary)}。浅绿色单元格为可编辑本周预估栏；其它单元格为原始/历史/差异数据，只能查看，不能修改。</p>
+      <div class="sheet-tabs">{sheet_tab_html}</div>
+      <p class="subtext">可在线修改范围：{html.escape(editable_summary)}。浅绿色单元格为可编辑本周预估栏；其它单元格为原始/历史/差异数据，只能查看，不能修改。{f"当前为整表模式，已展开到 {sheet_max_row} 行 × {sheet_max_col} 列。" if full_view else "如果要一次查看整张工作表，可点击“整表模式”。"}</p>
     </section>
     <div class="table-wrap">
       <table>
@@ -1548,6 +1600,7 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
             cols_limit = int(form.get("cols", ["140"])[0])
         except ValueError:
             cols_limit = 140
+        full_view = (form.get("full", ["0"])[0] or "0").strip() in {"1", "true", "yes", "on"}
 
         cell_match = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]{0,6})", cell)
         if not cell_match:
@@ -1587,6 +1640,7 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
                 start_col=start_col,
                 rows_limit=rows_limit,
                 cols_limit=cols_limit,
+                full_view=full_view,
             ).decode("utf-8"),
             head=head,
         )
@@ -1594,7 +1648,7 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
         write_html(
             handler,
             400,
-            render_preview_page(error=f"保存失败：{exc}", selected_sheet=selected_sheet).decode("utf-8"),
+            render_preview_page(error=f"保存失败：{exc}", selected_sheet=selected_sheet, full_view=full_view).decode("utf-8"),
             head=head,
         )
 
@@ -1922,6 +1976,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                 cols_limit = int(query.get("cols", ["140"])[0])
             except ValueError:
                 cols_limit = 140
+            full_view = (query.get("full", ["0"])[0] or "0").strip() in {"1", "true", "yes", "on"}
             write_html(
                 self,
                 200,
@@ -1931,6 +1986,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                     start_col=start_col,
                     rows_limit=rows_limit,
                     cols_limit=cols_limit,
+                    full_view=full_view,
                 ).decode("utf-8"),
             )
             return
@@ -1988,7 +2044,34 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/preview":
-            write_html(self, 200, render_preview_page().decode("utf-8"), head=True)
+            selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
+            try:
+                start_row = int(query.get("start_row", ["1"])[0])
+            except ValueError:
+                start_row = 1
+            start_col = parse_column_ref(query.get("start_col", ["1"])[0], default=1)
+            try:
+                rows_limit = int(query.get("rows", ["80"])[0])
+            except ValueError:
+                rows_limit = 80
+            try:
+                cols_limit = int(query.get("cols", ["140"])[0])
+            except ValueError:
+                cols_limit = 140
+            full_view = (query.get("full", ["0"])[0] or "0").strip() in {"1", "true", "yes", "on"}
+            write_html(
+                self,
+                200,
+                render_preview_page(
+                    selected_sheet=selected_sheet,
+                    start_row=start_row,
+                    start_col=start_col,
+                    rows_limit=rows_limit,
+                    cols_limit=cols_limit,
+                    full_view=full_view,
+                ).decode("utf-8"),
+                head=True,
+            )
             return
 
         if path == "/status":
