@@ -22,13 +22,15 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.utils.cell import coordinate_to_tuple
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from fill_sales import (
     BUSINESS_OWNERS,
+    DATA_START_ROW,
     SUPPORTED_PREDICTION_SUFFIXES,
     SUPPORTED_SALES_SUFFIXES,
+    extract_fill_target_month,
+    find_quantity_amount_pairs,
     process_sales_workbooks,
 )
 
@@ -496,7 +498,7 @@ def render_page(
         '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
     )
     preview_latest_html = (
-        '<a class="secondary button" href="/preview">在线预览/编辑</a>' if has_master else ""
+        '<a class="secondary button" href="/preview">在线预览</a>' if has_master else ""
     )
     state_text = (
         f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
@@ -1173,24 +1175,168 @@ def send_xlsx(handler: BaseHTTPRequestHandler, path: Path, download_name: str, h
             shutil.copyfileobj(f, handler.wfile)
 
 
-def parse_cell_edit_value(raw_value: str):
+def parse_editable_forecast_value(raw_value: str):
     value = raw_value.strip()
     if value == "":
         return None
     if value.startswith("="):
-        return value
-    if re.fullmatch(r"-?\d+", value) and not re.match(r"-?0\d+", value):
-        return int(value)
-    if re.fullmatch(r"-?(?:\d+\.\d+|\d+\.|\.\d+)", value):
-        return float(value)
-    return raw_value
+        raise ValueError("预估栏只能填写数字，不能填写公式。")
+    normalized = value.replace(",", "").replace("，", "")
+    if re.fullmatch(r"-?\d+", normalized) and not re.match(r"-?0\d+", normalized):
+        return int(normalized)
+    if re.fullmatch(r"-?(?:\d+\.\d+|\d+\.|\.\d+)", normalized):
+        return float(normalized)
+    raise ValueError("预估栏只能填写数字，留空则清空该格。")
+
+
+def parse_column_ref(value: str, default: int = 1) -> int:
+    raw = str(value or "").strip().upper()
+    if not raw:
+        return default
+    if re.fullmatch(r"[A-Z]{1,3}", raw):
+        return column_index_from_string(raw)
+    if re.fullmatch(r"[1-9][0-9]{0,3}", raw):
+        return int(raw)
+    return default
+
+
+def cell_fill_rgb(cell) -> Optional[tuple[int, int, int]]:
+    color = getattr(getattr(cell, "fill", None), "fgColor", None)
+    rgb = getattr(color, "rgb", None)
+    if not rgb or not isinstance(rgb, str):
+        return None
+    value = rgb[-6:]
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", value):
+        return None
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def is_green_header_cell(cell) -> bool:
+    color = getattr(getattr(cell, "fill", None), "fgColor", None)
+    if getattr(color, "type", None) == "theme":
+        try:
+            return int(color.theme) == 6
+        except (TypeError, ValueError):
+            return False
+    rgb = cell_fill_rgb(cell)
+    if rgb is None:
+        return False
+    red, green, blue = rgb
+    return green >= 120 and green > red + 15 and green > blue + 15
+
+
+def cell_has_visible_fill(cell) -> bool:
+    color = getattr(getattr(cell, "fill", None), "fgColor", None)
+    color_type = getattr(color, "type", None)
+    if color_type == "theme":
+        return True
+    if color_type == "indexed":
+        return True
+    rgb = getattr(color, "rgb", None)
+    return bool(isinstance(rgb, str) and rgb[-6:] not in {"000000", "00000000"})
+
+
+def editable_pair_by_label(label: str) -> bool:
+    text = str(label or "")
+    if not any(word in text for word in ("预估", "预计")):
+        return False
+    if any(word in text for word in ("差异", "已完成")):
+        return False
+    return True
+
+
+def pair_has_green_header(ws, pair) -> bool:
+    cells = (
+        ws.cell(3, pair.qty_col),
+        ws.cell(3, pair.amt_col),
+        ws.cell(4, pair.qty_col),
+        ws.cell(4, pair.amt_col),
+    )
+    return any(is_green_header_cell(cell) for cell in cells)
+
+
+def pair_has_visible_header_fill(ws, pair) -> bool:
+    cells = (
+        ws.cell(3, pair.qty_col),
+        ws.cell(3, pair.amt_col),
+        ws.cell(4, pair.qty_col),
+        ws.cell(4, pair.amt_col),
+    )
+    return any(cell_has_visible_fill(cell) for cell in cells)
+
+
+def editable_forecast_columns(wb, sheet_name: str) -> dict[int, str]:
+    if sheet_name not in wb.sheetnames:
+        return {}
+    ws = wb[sheet_name]
+
+    # Read-only worksheets are very slow when ws.cell() is called repeatedly because
+    # each random lookup can rescan worksheet XML. Read both header rows in one pass.
+    scan_max_col = min(max(int(ws.max_column or 1), 1), 260)
+    header_rows = list(ws.iter_rows(min_row=3, max_row=4, min_col=1, max_col=scan_max_col))
+    if len(header_rows) < 2:
+        return {}
+    label_row, field_row = header_rows
+    candidate_pairs = []
+    for offset in range(scan_max_col - 1):
+        qty_text = str(field_row[offset].value or "").strip()
+        amt_text = str(field_row[offset + 1].value or "").strip()
+        if "数量" not in qty_text or "金额" not in amt_text:
+            continue
+        label = str(label_row[offset].value or "").strip()
+        if not editable_pair_by_label(label):
+            continue
+        qty_col = offset + 1
+        candidate_pairs.append(
+            {
+                "label": label,
+                "qty_col": qty_col,
+                "amt_col": qty_col + 1,
+                "cells": (
+                    label_row[offset],
+                    label_row[offset + 1],
+                    field_row[offset],
+                    field_row[offset + 1],
+                ),
+            }
+        )
+
+    green_pairs = [
+        pair for pair in candidate_pairs if any(is_green_header_cell(cell) for cell in pair["cells"])
+    ]
+    selected_pairs = green_pairs
+
+    if not selected_pairs:
+        if any(
+            any(cell_has_visible_fill(cell) for cell in pair["cells"])
+            for pair in candidate_pairs
+        ):
+            return {}
+        latest_by_month = {}
+        for pair in candidate_pairs:
+            month = extract_fill_target_month(sheet_name, pair["label"])
+            if month is None:
+                continue
+            current = latest_by_month.get(month)
+            if current is None or pair["qty_col"] > current["qty_col"]:
+                latest_by_month[month] = pair
+        selected_pairs = list(latest_by_month.values())
+
+    allowed: dict[int, str] = {}
+    for pair in selected_pairs:
+        allowed[pair["qty_col"]] = f'{pair["label"]} 数量'
+        allowed[pair["amt_col"]] = f'{pair["label"]} 金额'
+    return allowed
 
 
 def render_preview_page(
     message: str = "",
     error: str = "",
     selected_sheet: str = "",
+    start_row: int = 1,
+    start_col: int = 1,
     rows_limit: int = 80,
+    cols_limit: int = 140,
 ) -> bytes:
     if not master_sales_exists():
         return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
@@ -1198,31 +1344,66 @@ def render_preview_page(
     metadata = ensure_metadata_schema(load_metadata())
     message_html = f'<div class="notice success">{html.escape(message)}</div>' if message else ""
     error_html = f'<div class="notice error">{html.escape(error)}</div>' if error else ""
+    start_row = max(1, start_row)
+    start_col = max(1, start_col)
     rows_limit = max(20, min(rows_limit, 200))
+    cols_limit = max(40, min(cols_limit, 260))
 
-    wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=False)
+    try:
+        wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=True)
+    except Exception as exc:  # noqa: BLE001
+        return render_page(error=f"在线预览失败：当前共用销售排单无法读取（{exc}）。请先下载当前最新版确认文件，或重新上传本周共用排单。")
+
     try:
         sheet_names = wb.sheetnames
         if selected_sheet not in sheet_names:
             selected_sheet = sheet_names[0]
         ws = wb[selected_sheet]
-        max_row = min(ws.max_row, rows_limit)
-        max_col = min(ws.max_column, 80)
+        editable_columns = editable_forecast_columns(wb, selected_sheet)
+        editable_labels = sorted(set(editable_columns.values()))
+        editable_summary = "、".join(editable_labels[:8])
+        if len(editable_labels) > 8:
+            editable_summary += f" 等 {len(editable_labels)} 类"
+        if not editable_summary:
+            editable_summary = "当前 Sheet 没有识别到可在线修改的本周预估栏"
+        max_row = min(ws.max_row, start_row + rows_limit - 1)
+        max_col = min(ws.max_column, start_col + cols_limit - 1)
         sheet_options = "\n".join(
             f'<option value="{html.escape(name)}" {"selected" if name == selected_sheet else ""}>{html.escape(name)}</option>'
             for name in sheet_names
         )
-        header_cells = "".join(f"<th>{get_column_letter(col)}</th>" for col in range(1, max_col + 1))
+        header_cells = "".join(f"<th>{get_column_letter(col)}</th>" for col in range(start_col, max_col + 1))
         body_rows = []
-        for row_idx in range(1, max_row + 1):
+        for row_idx, row_values in enumerate(
+            ws.iter_rows(min_row=start_row, max_row=max_row, min_col=start_col, max_col=max_col, values_only=True),
+            start=start_row,
+        ):
             cells = [f"<th>{row_idx}</th>"]
-            for col_idx in range(1, max_col + 1):
-                value = ws.cell(row_idx, col_idx).value
+            for col_idx, value in enumerate(row_values, start=start_col):
                 display = "" if value is None else str(value)
                 if len(display) > 80:
                     display = display[:77] + "..."
                 coord = f"{get_column_letter(col_idx)}{row_idx}"
-                cells.append(f'<td title="{html.escape(coord)}">{html.escape(display)}</td>')
+                editable_label = editable_columns.get(col_idx) if row_idx >= DATA_START_ROW else None
+                if editable_label:
+                    cells.append(
+                        '<td class="editable-cell" '
+                        f'title="{html.escape(coord)}：{html.escape(editable_label)}">'
+                        '<form class="cell-form" method="post" action="/edit-cell">'
+                        f'<input type="hidden" name="sheet" value="{html.escape(selected_sheet)}">'
+                        f'<input type="hidden" name="cell" value="{html.escape(coord)}">'
+                        f'<input type="hidden" name="start_row" value="{start_row}">'
+                        f'<input type="hidden" name="start_col" value="{start_col}">'
+                        f'<input type="hidden" name="rows" value="{rows_limit}">'
+                        f'<input type="hidden" name="cols" value="{cols_limit}">'
+                        f'<input class="cell-input" name="value" value="{html.escape(display)}" '
+                        f'aria-label="{html.escape(coord)}">'
+                        '<button class="cell-save" type="submit">保存</button>'
+                        '</form>'
+                        '</td>'
+                    )
+                else:
+                    cells.append(f'<td title="{html.escape(coord)}">{html.escape(display)}</td>')
             body_rows.append("<tr>" + "".join(cells) + "</tr>")
         table_html = "\n".join(body_rows)
     finally:
@@ -1234,7 +1415,7 @@ def render_preview_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>在线预览/编辑</title>
+  <title>在线预览</title>
   <style>
     :root {{
       --paper: #f6f7f4;
@@ -1272,14 +1453,32 @@ def render_preview_page(
     th, td {{ border: 1px solid #d7ddd4; padding: 5px 7px; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }}
     th {{ position: sticky; top: 0; background: #e8efe9; z-index: 1; }}
     tr th:first-child {{ position: sticky; left: 0; z-index: 2; background: #e8efe9; }}
+    .editable-cell {{ background: #e4f2ec; padding: 2px; }}
+    .cell-form {{ display: flex; flex-wrap: nowrap; gap: 3px; align-items: center; }}
+    .cell-input {{
+      width: 82px;
+      min-height: 26px;
+      padding: 3px 5px;
+      border-color: #9fcfbb;
+      background: #fbfffd;
+      font-size: 12px;
+    }}
+    .cell-save {{
+      min-height: 26px;
+      padding: 3px 6px;
+      border-radius: 5px;
+      color: #fff;
+      background: var(--accent);
+      font-size: 12px;
+    }}
   </style>
 </head>
 <body>
   <main class="shell">
     <div class="top">
       <div>
-        <h1>在线预览/编辑当前最新版</h1>
-        <p class="subtext">当前文件：{html.escape(latest_name)}。预览最多显示前 {rows_limit} 行、前 80 列；修改会直接保存到网站当前共用表格。</p>
+        <h1>在线预览当前最新版</h1>
+        <p class="subtext">当前文件：{html.escape(latest_name)}。整张表可查看和下载；只有系统识别出的本周预估数量/金额栏可以在线修改，原始数据列不可修改。</p>
       </div>
       <a class="secondary button" href="/">返回上传页</a>
     </div>
@@ -1290,25 +1489,24 @@ def render_preview_page(
         <label>选择 Sheet
           <select name="sheet">{sheet_options}</select>
         </label>
+        <label>起始行
+          <input name="start_row" value="{start_row}" inputmode="numeric">
+        </label>
+        <label>起始列
+          <input name="start_col" value="{html.escape(get_column_letter(start_col))}" placeholder="例如 BQ">
+        </label>
         <label>预览行数
           <input name="rows" value="{rows_limit}" inputmode="numeric">
+        </label>
+        <label>预览列数
+          <input name="cols" value="{cols_limit}" inputmode="numeric">
         </label>
         <button class="primary" type="submit">刷新预览</button>
         <a class="secondary button" href="/download/latest">下载当前最新版</a>
       </form>
     </section>
     <section class="panel">
-      <form method="post" action="/edit-cell">
-        <input type="hidden" name="sheet" value="{html.escape(selected_sheet)}">
-        <label>单元格
-          <input name="cell" placeholder="例如 BU25" required>
-        </label>
-        <label>新内容
-          <input name="value" placeholder="留空则清空该单元格">
-        </label>
-        <button class="primary" type="submit">保存修改</button>
-        <span class="subtext">提示：点击表格单元格时可在浏览器提示里看到坐标。</span>
-      </form>
+      <p class="subtext">可在线修改范围：{html.escape(editable_summary)}。浅绿色单元格为可编辑本周预估栏；其它单元格为原始/历史/差异数据，只能查看，不能修改。</p>
     </section>
     <div class="table-wrap">
       <table>
@@ -1324,37 +1522,57 @@ def render_preview_page(
 
 
 def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
+    selected_sheet = ""
     try:
         if job_is_running():
-            raise ValueError("当前有预测正在后台回填，请处理完成后再编辑表格。")
+            raise ValueError("当前有预测正在后台回填，请处理完成后再编辑本周预估栏。")
         if not master_sales_exists():
             raise ValueError("还没有共用销售排单可编辑，请先上传本周排单。")
 
         content_length = int(handler.headers.get("Content-Length", "0") or "0")
         body = handler.rfile.read(content_length).decode("utf-8")
         form = urllib.parse.parse_qs(body, keep_blank_values=True)
-        sheet = (form.get("sheet", [""])[0] or "").strip()
+        selected_sheet = (form.get("sheet", [""])[0] or "").strip()
         cell = (form.get("cell", [""])[0] or "").strip().upper().replace(" ", "")
         raw_value = form.get("value", [""])[0]
+        try:
+            start_row = int(form.get("start_row", ["1"])[0])
+        except ValueError:
+            start_row = 1
+        start_col = parse_column_ref(form.get("start_col", ["1"])[0], default=1)
+        try:
+            rows_limit = int(form.get("rows", ["80"])[0])
+        except ValueError:
+            rows_limit = 80
+        try:
+            cols_limit = int(form.get("cols", ["140"])[0])
+        except ValueError:
+            cols_limit = 140
 
-        if not re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]{0,6}", cell):
-            raise ValueError("单元格格式不正确，请输入类似 BU25 的位置。")
+        cell_match = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]{0,6})", cell)
+        if not cell_match:
+            raise ValueError("单元格格式不正确。")
+        cell_col = column_index_from_string(cell_match.group(1))
+        cell_row = int(cell_match.group(2))
 
         with STATE_LOCK:
             wb = load_workbook(MASTER_SALES_PATH)
             try:
-                if sheet not in wb.sheetnames:
-                    raise ValueError(f"没有找到 Sheet：{sheet}")
-                ws = wb[sheet]
-                coordinate_to_tuple(cell)
-                ws[cell].value = parse_cell_edit_value(raw_value)
+                if selected_sheet not in wb.sheetnames:
+                    raise ValueError(f"没有找到 Sheet：{selected_sheet}")
+                editable_columns = editable_forecast_columns(wb, selected_sheet)
+                if cell_row < DATA_START_ROW or cell_col not in editable_columns:
+                    raise ValueError("该单元格属于原始数据、历史预估或差异栏，不能在线修改。只能修改浅绿色的本周预估数量/金额格。")
+
+                ws = wb[selected_sheet]
+                ws[cell].value = parse_editable_forecast_value(raw_value)
                 wb.save(MASTER_SALES_PATH)
                 shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
                 sync_master_files_to_remote()
 
                 metadata = ensure_metadata_schema(load_metadata())
                 metadata["last_manual_edit_at"] = now_label()
-                metadata["last_manual_edit_cell"] = f"{sheet}!{cell}"
+                metadata["last_manual_edit_cell"] = f"{selected_sheet}!{cell}"
                 save_metadata(metadata)
             finally:
                 wb.close()
@@ -1362,14 +1580,21 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
         write_html(
             handler,
             200,
-            render_preview_page(message=f"已保存 {sheet}!{cell} 的修改。", selected_sheet=sheet).decode("utf-8"),
+            render_preview_page(
+                message=f"已保存 {selected_sheet}!{cell} 的本周预估修改。",
+                selected_sheet=selected_sheet,
+                start_row=start_row,
+                start_col=start_col,
+                rows_limit=rows_limit,
+                cols_limit=cols_limit,
+            ).decode("utf-8"),
             head=head,
         )
     except Exception as exc:  # noqa: BLE001
         write_html(
             handler,
             400,
-            render_preview_page(error=f"保存失败：{exc}").decode("utf-8"),
+            render_preview_page(error=f"保存失败：{exc}", selected_sheet=selected_sheet).decode("utf-8"),
             head=head,
         )
 
@@ -1685,13 +1910,28 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
         if path == "/preview":
             selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
             try:
+                start_row = int(query.get("start_row", ["1"])[0])
+            except ValueError:
+                start_row = 1
+            start_col = parse_column_ref(query.get("start_col", ["1"])[0], default=1)
+            try:
                 rows_limit = int(query.get("rows", ["80"])[0])
             except ValueError:
                 rows_limit = 80
+            try:
+                cols_limit = int(query.get("cols", ["140"])[0])
+            except ValueError:
+                cols_limit = 140
             write_html(
                 self,
                 200,
-                render_preview_page(selected_sheet=selected_sheet, rows_limit=rows_limit).decode("utf-8"),
+                render_preview_page(
+                    selected_sheet=selected_sheet,
+                    start_row=start_row,
+                    start_col=start_col,
+                    rows_limit=rows_limit,
+                    cols_limit=cols_limit,
+                ).decode("utf-8"),
             )
             return
 
