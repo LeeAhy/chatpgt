@@ -172,6 +172,20 @@ def owner_link(owner: str) -> str:
     return f"/owner/{urllib.parse.quote(owner)}"
 
 
+def resolve_sheet_name(requested: str, sheet_names: list[str]) -> str:
+    if not sheet_names:
+        raise ValueError("工作簿里没有可用的 Sheet。")
+    if requested in sheet_names:
+        return requested
+    normalized = requested.strip()
+    if not normalized:
+        return sheet_names[0]
+    matches = [name for name in sheet_names if name.strip() == normalized]
+    if len(matches) == 1:
+        return matches[0]
+    return requested
+
+
 def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
@@ -1360,6 +1374,7 @@ def render_preview_page(
 
     try:
         sheet_names = wb.sheetnames
+        selected_sheet = resolve_sheet_name(selected_sheet, sheet_names)
         if selected_sheet not in sheet_names:
             selected_sheet = sheet_names[0]
         ws = wb[selected_sheet]
@@ -1849,6 +1864,7 @@ def editor_window_payload(
     rows_limit: int,
     cols_limit: int,
 ) -> dict:
+    sheet_name = resolve_sheet_name(sheet_name, list(wb.sheetnames))
     if sheet_name not in wb.sheetnames:
         raise ValueError(f"没有找到 Sheet：{sheet_name}")
 
@@ -1929,6 +1945,7 @@ def render_workbook_editor_page(
     try:
         wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=True)
         sheet_names = wb.sheetnames
+        selected_sheet = resolve_sheet_name(selected_sheet, sheet_names)
         if selected_sheet not in sheet_names:
             selected_sheet = sheet_names[0]
         selected_ws = wb[selected_sheet]
@@ -2509,7 +2526,7 @@ def handle_editor_window(handler: BaseHTTPRequestHandler, head: bool = False) ->
         if not master_sales_exists():
             raise ValueError("还没有共用销售排单可预览，请先上传本周排单。")
         query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
-        sheet_name = (query.get("sheet", [""])[0] or "").strip()
+        sheet_name = query.get("sheet", [""])[0] or ""
         try:
             start_row = int(query.get("start_row", ["1"])[0])
         except ValueError:
@@ -2526,7 +2543,14 @@ def handle_editor_window(handler: BaseHTTPRequestHandler, head: bool = False) ->
         with STATE_LOCK:
             wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=True)
             try:
-                payload = editor_window_payload(wb, sheet_name or wb.sheetnames[0], start_row, start_col, rows_limit, cols_limit)
+                payload = editor_window_payload(
+                    wb,
+                    resolve_sheet_name(sheet_name or wb.sheetnames[0], list(wb.sheetnames)),
+                    start_row,
+                    start_col,
+                    rows_limit,
+                    cols_limit,
+                )
             finally:
                 wb.close()
         write_json(handler, 200, payload, head=head)
@@ -2542,7 +2566,7 @@ def handle_editor_save(handler: BaseHTTPRequestHandler, head: bool = False) -> N
             raise ValueError("还没有共用销售排单可编辑，请先上传本周排单。")
 
         payload = read_json_body(handler)
-        sheet_name = (payload.get("sheet") or "").strip()
+        sheet_name = payload.get("sheet") or ""
         changes = payload.get("changes") or []
         if not sheet_name:
             raise ValueError("缺少 Sheet 名称。")
@@ -2556,6 +2580,7 @@ def handle_editor_save(handler: BaseHTTPRequestHandler, head: bool = False) -> N
         with STATE_LOCK:
             wb = load_workbook(MASTER_SALES_PATH)
             try:
+                sheet_name = resolve_sheet_name(sheet_name, list(wb.sheetnames))
                 if sheet_name not in wb.sheetnames:
                     raise ValueError(f"没有找到 Sheet：{sheet_name}")
                 editable_columns = editable_forecast_columns(wb, sheet_name)
@@ -2599,7 +2624,7 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
         content_length = int(handler.headers.get("Content-Length", "0") or "0")
         body = handler.rfile.read(content_length).decode("utf-8")
         form = urllib.parse.parse_qs(body, keep_blank_values=True)
-        selected_sheet = (form.get("sheet", [""])[0] or "").strip()
+        selected_sheet = form.get("sheet", [""])[0] or ""
         cell = (form.get("cell", [""])[0] or "").strip().upper().replace(" ", "")
         raw_value = form.get("value", [""])[0]
         try:
@@ -2626,6 +2651,7 @@ def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> Non
         with STATE_LOCK:
             wb = load_workbook(MASTER_SALES_PATH)
             try:
+                selected_sheet = resolve_sheet_name(selected_sheet, list(wb.sheetnames))
                 if selected_sheet not in wb.sheetnames:
                     raise ValueError(f"没有找到 Sheet：{selected_sheet}")
                 editable_columns = editable_forecast_columns(wb, selected_sheet)
