@@ -1911,8 +1911,6 @@ def render_workbook_editor_page(
     cols_limit: int = 40,
     full_view: bool = False,
 ) -> bytes:
-    return render_onlyoffice_page(message=message, error=error)
-
     if not master_sales_exists():
         return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
 
