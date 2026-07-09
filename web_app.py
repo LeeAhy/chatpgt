@@ -2381,12 +2381,12 @@ def render_workbook_editor_page(
       table.appendChild(thead);
 
       const tbody = document.createElement("tbody");
-      payload.rows.forEach((row) => {{
+      payload.rows.forEach((rowCells) => {{
         const tr = document.createElement("tr");
         const rowHeader = document.createElement("th");
-        rowHeader.textContent = row.row;
+        rowHeader.textContent = rowCells.length ? rowCells[0].row : "";
         tr.appendChild(rowHeader);
-        row.cells.forEach((cell) => {{
+        rowCells.forEach((cell) => {{
           const td = document.createElement("td");
           if (cell.fill) td.style.background = cell.fill;
           td.title = cell.coord;
