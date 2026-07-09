@@ -23,6 +23,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from openpyxl import load_workbook
+from openpyxl.cell.cell import MergedCell
 from openpyxl.utils import column_index_from_string, get_column_letter
 
 from fill_sales import (
@@ -1204,6 +1205,29 @@ def parse_editable_forecast_value(raw_value: str):
     raise ValueError("预估栏只能填写数字，留空则清空该格。")
 
 
+def parse_workbook_cell_value(raw_value: str):
+    value = raw_value.replace("\r\n", "\n").replace("\r", "\n")
+    if value == "":
+        return None
+    if value.startswith("'"):
+        return value[1:]
+    if value.startswith("="):
+        return value
+
+    normalized = value.replace(",", "").replace("，", "")
+    if re.fullmatch(r"-?\d+", normalized) and not re.match(r"-?0\d+", normalized):
+        return int(normalized)
+    if re.fullmatch(r"-?(?:\d+\.\d+|\d+\.|\.\d+)", normalized):
+        return float(normalized)
+
+    upper = value.strip().upper()
+    if upper == "TRUE":
+        return True
+    if upper == "FALSE":
+        return False
+    return value
+
+
 def parse_column_ref(value: str, default: int = 1) -> int:
     raw = str(value or "").strip().upper()
     if not raw:
@@ -1342,6 +1366,24 @@ def editable_forecast_columns(wb, sheet_name: str) -> dict[int, str]:
         allowed[pair["qty_col"]] = f'{pair["label"]} 数量'
         allowed[pair["amt_col"]] = f'{pair["label"]} 金额'
     return allowed
+
+
+def merged_follower_coords(ws, start_row: int, max_row: int, start_col: int, max_col: int) -> set[str]:
+    blocked: set[str] = set()
+    try:
+        ranges = list(ws.merged_cells.ranges)
+    except Exception:
+        ranges = []
+    for merged_range in ranges:
+        min_col, min_row, end_col, end_row = merged_range.bounds
+        if end_row < start_row or min_row > max_row or end_col < start_col or min_col > max_col:
+            continue
+        for row_idx in range(max(min_row, start_row), min(end_row, max_row) + 1):
+            for col_idx in range(max(min_col, start_col), min(end_col, max_col) + 1):
+                if row_idx == min_row and col_idx == min_col:
+                    continue
+                blocked.add(f"{get_column_letter(col_idx)}{row_idx}")
+    return blocked
 
 
 def render_preview_page(
@@ -1869,7 +1911,6 @@ def editor_window_payload(
         raise ValueError(f"没有找到 Sheet：{sheet_name}")
 
     ws = wb[sheet_name]
-    editable_columns = editable_forecast_columns(wb, sheet_name)
     sheet_max_row = max(int(ws.max_row or 1), 1)
     sheet_max_col = max(int(ws.max_column or 1), 1)
     start_row = max(1, min(start_row, sheet_max_row))
@@ -1879,6 +1920,7 @@ def editor_window_payload(
     max_row = min(sheet_max_row, start_row + rows_limit - 1)
     max_col = min(sheet_max_col, start_col + cols_limit - 1)
     col_headers = [get_column_letter(col_idx) for col_idx in range(start_col, max_col + 1)]
+    blocked_coords = merged_follower_coords(ws, start_row, max_row, start_col, max_col)
 
     rows: list[list[dict]] = []
     for row_idx, row_values in enumerate(
@@ -1894,9 +1936,9 @@ def editor_window_payload(
                     "row": row_idx,
                     "col": col_idx,
                     "text": "" if value is None else str(value),
-                    "editable": bool(row_idx >= DATA_START_ROW and col_idx in editable_columns),
+                    "editable": f"{get_column_letter(col_idx)}{row_idx}" not in blocked_coords,
                     "fill": fill_css_from_cell(cell),
-                    "label": editable_columns.get(col_idx, ""),
+                    "label": "",
                 }
             )
         rows.append(row_cells)
@@ -2090,10 +2132,13 @@ def render_workbook_editor_page(
     }}
     .controls {{
       display: grid;
-      grid-template-columns: repeat(5, auto);
+      grid-template-columns: repeat(6, auto);
       gap: 8px;
       align-items: end;
       justify-content: end;
+    }}
+    .wide-control {{
+      min-width: 132px;
     }}
     label {{
       display: grid;
@@ -2193,10 +2238,10 @@ def render_workbook_editor_page(
       outline: none;
     }}
     .editable {{
-      background: #e4f2ec;
+      background: transparent;
     }}
     .locked {{
-      background: transparent;
+      background: rgba(23, 33, 27, 0.03);
     }}
     .dirty {{
       box-shadow: inset 0 0 0 2px rgba(19, 111, 99, 0.35);
@@ -2218,6 +2263,16 @@ def render_workbook_editor_page(
       font-size: 13px;
       line-height: 1.55;
     }}
+    .formula-bar {{
+      display: grid;
+      grid-template-columns: 120px 1fr auto;
+      gap: 8px;
+      align-items: end;
+      margin-top: 12px;
+    }}
+    .formula-bar input {{
+      width: 100%;
+    }}
     .statusline {{
       margin-top: 10px;
       color: var(--muted);
@@ -2238,7 +2293,7 @@ def render_workbook_editor_page(
     <section class="top">
       <div>
         <h1>在线编辑工作簿</h1>
-        <p class="subtext">当前文件：{html.escape(latest_name)}。这个页面直接读取并回写同一个 xlsx 工作簿，你可以像打开表格一样切 Sheet、跳行列、编辑绿色回填栏。</p>
+        <p class="subtext">当前文件：{html.escape(latest_name)}。这个页面直接读取并回写同一个 xlsx 工作簿，你可以像打开表格一样切 Sheet、跳行列、定位单元格、整本编辑并保存，不会转换成其他文件格式。</p>
       </div>
       <div class="access">{html.escape(storage_description())}</div>
     </section>
@@ -2261,13 +2316,20 @@ def render_workbook_editor_page(
           <label>起始列 <input id="start-col" type="text" value="{html.escape(get_column_letter(start_col))}"></label>
           <label>行数 <input id="rows-limit" type="number" min="1" max="200" value="{rows_limit}"></label>
           <label>列数 <input id="cols-limit" type="number" min="1" max="120" value="{cols_limit}"></label>
+          <label class="wide-control">定位单元格 <input id="goto-cell" type="text" placeholder="例如 BX27"></label>
           <div style="display:flex; gap:8px; align-items:end;">
+            <button id="goto-btn" class="secondary" type="button">定位</button>
             <button id="refresh-btn" class="secondary" type="button">刷新窗口</button>
             <button id="save-btn" class="primary" type="button">保存修改</button>
           </div>
         </div>
       </div>
-      <div class="hint">浅绿色单元格可编辑，其他单元格只读。这个编辑器不会把 xlsx 转成别的文件格式，保存时仍然写回原始共用销售排单。</div>
+      <div class="formula-bar">
+        <label>当前单元格 <input id="selected-cell" type="text" readonly></label>
+        <label>编辑栏 <input id="formula-bar" type="text" placeholder="这里可直接编辑当前单元格，公式请以 = 开头"></label>
+        <button id="apply-formula-btn" class="secondary" type="button">应用到当前格</button>
+      </div>
+      <div class="hint">整个工作簿都会以 xlsx 原样读取并写回；公式请以 <code>=</code> 开头，若要强制输入文本可在最前面加英文单引号 <code>'</code>。合并单元格中除左上角外的从属格会保持只读。</div>
     </section>
 
     <section class="panel">
@@ -2300,8 +2362,13 @@ def render_workbook_editor_page(
     const startColEl = document.getElementById("start-col");
     const rowsLimitEl = document.getElementById("rows-limit");
     const colsLimitEl = document.getElementById("cols-limit");
+    const gotoCellEl = document.getElementById("goto-cell");
+    const gotoBtn = document.getElementById("goto-btn");
     const refreshBtn = document.getElementById("refresh-btn");
     const saveBtn = document.getElementById("save-btn");
+    const selectedCellEl = document.getElementById("selected-cell");
+    const formulaBarEl = document.getElementById("formula-bar");
+    const applyFormulaBtn = document.getElementById("apply-formula-btn");
 
     function setStatus(text, kind = "") {{
       statusEl.textContent = text;
@@ -2350,6 +2417,127 @@ def render_workbook_editor_page(
         .replaceAll("'", "&#39;");
     }}
 
+    function columnToNumber(value) {{
+      const raw = String(value || "").trim().toUpperCase();
+      if (!/^[A-Z]{{1,3}}$/.test(raw)) return 1;
+      let total = 0;
+      for (const ch of raw) {{
+        total = total * 26 + (ch.charCodeAt(0) - 64);
+      }}
+      return total;
+    }}
+
+    function numberToColumn(value) {{
+      let num = Math.max(1, Number(value || 1));
+      let text = "";
+      while (num > 0) {{
+        const remain = (num - 1) % 26;
+        text = String.fromCharCode(65 + remain) + text;
+        num = Math.floor((num - 1) / 26);
+      }}
+      return text;
+    }}
+
+    function normalizeCoord(value) {{
+      const raw = String(value || "").trim().toUpperCase().replace(/\\s+/g, "");
+      const match = raw.match(/^([A-Z]{{1,3}})([1-9][0-9]*)$/);
+      if (!match) return null;
+      return {{
+        coord: raw,
+        colLetters: match[1],
+        row: Number(match[2]),
+        col: columnToNumber(match[1]),
+      }};
+    }}
+
+    function getInputByCoord(coord) {{
+      return grid.querySelector(`input[data-coord="${{coord}}"]`);
+    }}
+
+    function getCellNodeByCoord(coord) {{
+      return grid.querySelector(`[data-coord="${{coord}}"]`);
+    }}
+
+    function syncFormulaBar() {{
+      selectedCellEl.value = selectedCoord || "";
+      if (!selectedCoord) {{
+        formulaBarEl.value = "";
+        formulaBarEl.disabled = true;
+        applyFormulaBtn.disabled = true;
+        return;
+      }}
+      const input = getInputByCoord(selectedCoord);
+      if (input) {{
+        formulaBarEl.value = input.value;
+        formulaBarEl.disabled = false;
+        applyFormulaBtn.disabled = false;
+        return;
+      }}
+      const cellNode = getCellNodeByCoord(selectedCoord);
+      formulaBarEl.value = cellNode ? (cellNode.textContent || "") : "";
+      formulaBarEl.disabled = true;
+      applyFormulaBtn.disabled = true;
+    }}
+
+    function selectCoord(coord) {{
+      selectedCoord = coord || "";
+      highlightSelection();
+      syncFormulaBar();
+    }}
+
+    function registerDirty(input, sheetName, coord) {{
+      const key = `${{sheetName}}!${{coord}}`;
+      if (input.value === input.dataset.original) {{
+        dirtyCells.delete(key);
+        input.classList.remove("dirty");
+      }} else {{
+        dirtyCells.set(key, {{ sheet: sheetName, cell: coord, value: input.value }});
+        input.classList.add("dirty");
+      }}
+      if (selectedCoord === coord) {{
+        formulaBarEl.value = input.value;
+      }}
+      updateSaveState();
+    }}
+
+    function moveSelection(rowOffset, colOffset) {{
+      const current = normalizeCoord(selectedCoord);
+      if (!current) return;
+      const targetRow = Math.max(1, current.row + rowOffset);
+      const targetCol = Math.max(1, current.col + colOffset);
+      const nextCoord = `${{numberToColumn(targetCol)}}${{targetRow}}`;
+      const nextInput = getInputByCoord(nextCoord);
+      if (nextInput) {{
+        nextInput.focus();
+        nextInput.select();
+        return;
+      }}
+      startRowEl.value = Math.max(1, targetRow - 8);
+      startColEl.value = numberToColumn(Math.max(1, targetCol - 3));
+      selectedCoord = nextCoord;
+      loadWindow({{ resetSelection: false }}).then(() => {{
+        const loadedInput = getInputByCoord(nextCoord);
+        if (loadedInput) {{
+          loadedInput.focus();
+          loadedInput.select();
+        }} else {{
+          selectCoord(nextCoord);
+        }}
+      }}).catch((err) => {{
+        console.error(err);
+        setStatus(err.message || "移动失败", "error");
+      }});
+    }}
+
+    function applyFormulaBarValue() {{
+      if (!selectedCoord) return;
+      const input = getInputByCoord(selectedCoord);
+      if (!input) return;
+      input.value = formulaBarEl.value;
+      registerDirty(input, input.dataset.sheet || currentSheet, selectedCoord);
+      input.focus();
+    }}
+
     function buildGrid(payload) {{
       currentPayload = payload;
       currentWindow = {{
@@ -2390,32 +2578,41 @@ def render_workbook_editor_page(
           const td = document.createElement("td");
           if (cell.fill) td.style.background = cell.fill;
           td.title = cell.coord;
+          td.dataset.coord = cell.coord;
           if (cell.editable) {{
             const input = document.createElement("input");
+            const dirtyKey = `${{payload.sheet}}!${{cell.coord}}`;
+            const pending = dirtyCells.get(dirtyKey);
             input.className = "cell editable";
-            input.value = cell.text || "";
+            input.value = pending ? String(pending.value ?? "") : (cell.text || "");
             input.dataset.coord = cell.coord;
             input.dataset.original = cell.text || "";
             input.dataset.sheet = payload.sheet;
+            if (pending) {{
+              input.classList.add("dirty");
+            }}
             input.addEventListener("focus", () => {{
-              selectedCoord = cell.coord;
-              highlightSelection();
+              selectCoord(cell.coord);
             }});
             input.addEventListener("input", () => {{
-              const key = `${{payload.sheet}}!${{cell.coord}}`;
-              if (input.value === input.dataset.original) {{
-                dirtyCells.delete(key);
-                input.classList.remove("dirty");
-              }} else {{
-                dirtyCells.set(key, {{ sheet: payload.sheet, cell: cell.coord, value: input.value }});
-                input.classList.add("dirty");
-              }}
-              updateSaveState();
+              registerDirty(input, payload.sheet, cell.coord);
             }});
             input.addEventListener("keydown", (ev) => {{
-              if (ev.key === "Enter") {{
+              if (ev.key === "Enter" && !ev.shiftKey) {{
                 ev.preventDefault();
-                saveChanges();
+                moveSelection(1, 0);
+              }} else if (ev.key === "ArrowUp") {{
+                ev.preventDefault();
+                moveSelection(-1, 0);
+              }} else if (ev.key === "ArrowDown") {{
+                ev.preventDefault();
+                moveSelection(1, 0);
+              }} else if (ev.key === "ArrowLeft") {{
+                ev.preventDefault();
+                moveSelection(0, -1);
+              }} else if (ev.key === "ArrowRight") {{
+                ev.preventDefault();
+                moveSelection(0, 1);
               }}
             }});
             td.appendChild(input);
@@ -2424,8 +2621,8 @@ def render_workbook_editor_page(
             span.className = "cell-text locked";
             span.textContent = cell.text || "";
             td.appendChild(span);
+            td.addEventListener("click", () => selectCoord(cell.coord));
           }}
-          td.dataset.coord = cell.coord;
           tr.appendChild(td);
         }});
         tbody.appendChild(tr);
@@ -2433,7 +2630,14 @@ def render_workbook_editor_page(
       table.appendChild(tbody);
       grid.innerHTML = "";
       grid.appendChild(table);
+      if (!selectedCoord && payload.rows.length && payload.rows[0].length) {{
+        const firstEditable = grid.querySelector("input[data-coord]");
+        if (firstEditable) {{
+          selectedCoord = firstEditable.dataset.coord || "";
+        }}
+      }}
       highlightSelection();
+      syncFormulaBar();
       setStatus(`已加载 ${{payload.sheet}} 的窗口：第 ${{payload.start_row}} 行起，第 ${{payload.start_col_letter}} 列起，共 ${{payload.rows_limit}} 行 × ${{payload.cols_limit}} 列。`, "ready");
     }}
 
@@ -2489,8 +2693,51 @@ def render_workbook_editor_page(
       await loadWindow({{ resetSelection: false }});
     }}
 
+    gotoBtn.addEventListener("click", () => {{
+      const parsed = normalizeCoord(gotoCellEl.value);
+      if (!parsed) {{
+        setStatus("请输入类似 BX27 的单元格坐标。", "error");
+        return;
+      }}
+      startRowEl.value = Math.max(1, parsed.row - 8);
+      startColEl.value = numberToColumn(Math.max(1, parsed.col - 3));
+      selectedCoord = parsed.coord;
+      loadWindow({{ resetSelection: false }}).then(() => {{
+        const input = getInputByCoord(parsed.coord);
+        if (input) {{
+          input.focus();
+          input.select();
+        }} else {{
+          selectCoord(parsed.coord);
+        }}
+      }}).catch((err) => {{
+        console.error(err);
+        setStatus(err.message || "定位失败", "error");
+      }});
+    }});
+
     refreshBtn.addEventListener("click", () => loadWindow({{ resetSelection: false }}));
     saveBtn.addEventListener("click", () => saveChanges());
+    applyFormulaBtn.addEventListener("click", () => applyFormulaBarValue());
+    formulaBarEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter") {{
+        ev.preventDefault();
+        applyFormulaBarValue();
+      }}
+    }});
+    gotoCellEl.addEventListener("keydown", (ev) => {{
+      if (ev.key === "Enter") {{
+        ev.preventDefault();
+        gotoBtn.click();
+      }}
+    }});
+
+    document.addEventListener("keydown", (ev) => {{
+      if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "s") {{
+        ev.preventDefault();
+        saveChanges();
+      }}
+    }});
 
     window.addEventListener("beforeunload", (ev) => {{
       if (dirtyCells.size) {{
@@ -2541,7 +2788,7 @@ def handle_editor_window(handler: BaseHTTPRequestHandler, head: bool = False) ->
         except ValueError:
             cols_limit = 40
         with STATE_LOCK:
-            wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=True)
+            wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=False)
             try:
                 payload = editor_window_payload(
                     wb,
@@ -2583,7 +2830,6 @@ def handle_editor_save(handler: BaseHTTPRequestHandler, head: bool = False) -> N
                 sheet_name = resolve_sheet_name(sheet_name, list(wb.sheetnames))
                 if sheet_name not in wb.sheetnames:
                     raise ValueError(f"没有找到 Sheet：{sheet_name}")
-                editable_columns = editable_forecast_columns(wb, sheet_name)
                 ws = wb[sheet_name]
                 for item in changes:
                     cell = str(item.get("cell") or "").strip().upper().replace(" ", "")
@@ -2593,9 +2839,10 @@ def handle_editor_save(handler: BaseHTTPRequestHandler, head: bool = False) -> N
                         raise ValueError(f"单元格格式不正确：{cell}")
                     cell_col = column_index_from_string(cell_match.group(1))
                     cell_row = int(cell_match.group(2))
-                    if cell_row < DATA_START_ROW or cell_col not in editable_columns:
-                        raise ValueError(f"{cell} 属于原始数据或历史区域，不能在线修改。")
-                    ws[cell].value = parse_editable_forecast_value(raw_value)
+                    target_cell = ws[cell]
+                    if isinstance(target_cell, MergedCell):
+                        raise ValueError(f"{cell} 是合并单元格的从属格，请修改该合并区域左上角单元格。")
+                    ws[cell].value = parse_workbook_cell_value(raw_value)
                     saved_count += 1
                 wb.save(MASTER_SALES_PATH)
                 shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
