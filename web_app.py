@@ -1575,6 +1575,763 @@ def render_preview_page(
     return page.encode("utf-8")
 
 
+def fill_css_from_cell(cell) -> str:
+    rgb = cell_fill_rgb(cell)
+    if rgb is None:
+        return ""
+    red, green, blue = rgb
+    if red == green == blue == 255:
+        return ""
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def editor_window_payload(
+    wb,
+    sheet_name: str,
+    start_row: int,
+    start_col: int,
+    rows_limit: int,
+    cols_limit: int,
+) -> dict:
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(f"没有找到 Sheet：{sheet_name}")
+
+    ws = wb[sheet_name]
+    editable_columns = editable_forecast_columns(wb, sheet_name)
+    sheet_max_row = max(int(ws.max_row or 1), 1)
+    sheet_max_col = max(int(ws.max_column or 1), 1)
+    start_row = max(1, min(start_row, sheet_max_row))
+    start_col = max(1, min(start_col, sheet_max_col))
+    rows_limit = max(1, min(rows_limit, 200))
+    cols_limit = max(1, min(cols_limit, 120))
+    max_row = min(sheet_max_row, start_row + rows_limit - 1)
+    max_col = min(sheet_max_col, start_col + cols_limit - 1)
+    col_headers = [get_column_letter(col_idx) for col_idx in range(start_col, max_col + 1)]
+
+    rows: list[list[dict]] = []
+    for row_idx, row_values in enumerate(
+        ws.iter_rows(min_row=start_row, max_row=max_row, min_col=start_col, max_col=max_col, values_only=False),
+        start=start_row,
+    ):
+        row_cells: list[dict] = []
+        for col_idx, cell in enumerate(row_values, start=start_col):
+            value = cell.value
+            row_cells.append(
+                {
+                    "coord": f"{get_column_letter(col_idx)}{row_idx}",
+                    "row": row_idx,
+                    "col": col_idx,
+                    "text": "" if value is None else str(value),
+                    "editable": bool(row_idx >= DATA_START_ROW and col_idx in editable_columns),
+                    "fill": fill_css_from_cell(cell),
+                    "label": editable_columns.get(col_idx, ""),
+                }
+            )
+        rows.append(row_cells)
+
+    return {
+        "sheet": sheet_name,
+        "start_row": start_row,
+        "start_col": start_col,
+        "start_col_letter": get_column_letter(start_col),
+        "rows_limit": rows_limit,
+        "cols_limit": cols_limit,
+        "sheet_max_row": sheet_max_row,
+        "sheet_max_col": sheet_max_col,
+        "max_row": max_row,
+        "max_col": max_col,
+        "col_headers": col_headers,
+        "rows": rows,
+    }
+
+
+def render_workbook_editor_page(
+    message: str = "",
+    error: str = "",
+    selected_sheet: str = "",
+    start_row: int = 1,
+    start_col: int = 1,
+    rows_limit: int = 80,
+    cols_limit: int = 40,
+    full_view: bool = False,
+) -> bytes:
+    if not master_sales_exists():
+        return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
+
+    metadata = ensure_metadata_schema(load_metadata())
+    message_html = f'<div class="notice success">{html.escape(message)}</div>' if message else ""
+    error_html = f'<div class="notice error">{html.escape(error)}</div>' if error else ""
+    start_row = max(1, start_row)
+    start_col = max(1, start_col)
+    if full_view:
+        rows_limit = max(20, min(rows_limit, 120))
+        cols_limit = max(20, min(cols_limit, 80))
+    else:
+        rows_limit = max(20, min(rows_limit, 80))
+        cols_limit = max(20, min(cols_limit, 40))
+
+    try:
+        wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=True)
+        sheet_names = wb.sheetnames
+        if selected_sheet not in sheet_names:
+            selected_sheet = sheet_names[0]
+        selected_ws = wb[selected_sheet]
+        sheet_max_row = max(int(selected_ws.max_row or 1), 1)
+        sheet_max_col = max(int(selected_ws.max_column or 1), 1)
+        start_row = min(start_row, sheet_max_row)
+        start_col = min(start_col, sheet_max_col)
+        wb.close()
+    except Exception as exc:  # noqa: BLE001
+        return render_page(error=f"在线编辑器无法读取当前共用销售排单（{exc}）。请先下载当前最新版确认文件，或重新上传本周共用排单。")
+
+    latest_name = metadata.get("latest_name") or metadata.get("master_name") or "当前最新版"
+    sheet_names_json = json.dumps(sheet_names, ensure_ascii=False)
+    current_sheet_json = json.dumps(selected_sheet, ensure_ascii=False)
+    initial_state_json = json.dumps(
+        {
+            "sheet": selected_sheet,
+            "start_row": start_row,
+            "start_col": start_col,
+            "rows": rows_limit,
+            "cols": cols_limit,
+            "full": bool(full_view),
+        },
+        ensure_ascii=False,
+    )
+    page = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>在线编辑工作簿</title>
+  <style>
+    :root {{
+      --paper: #f6f7f4;
+      --panel: #ffffff;
+      --line: #d8ded5;
+      --text: #17211b;
+      --muted: #5f6b63;
+      --accent: #136f63;
+      --accent-dark: #0c4f47;
+      --danger: #b42318;
+      --success: #126b45;
+      --warn: #8a5800;
+      --shadow: 0 16px 34px rgba(28, 43, 34, 0.08);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      color: var(--text);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
+      background:
+        linear-gradient(90deg, rgba(19, 111, 99, 0.06) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(138, 88, 0, 0.05) 1px, transparent 1px),
+        var(--paper);
+      background-size: 28px 28px;
+    }}
+    .shell {{
+      width: min(1500px, calc(100% - 24px));
+      margin: 0 auto;
+      padding: 18px 0 28px;
+    }}
+    .top {{
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--line);
+    }}
+    h1 {{
+      margin: 0 0 6px;
+      font-size: 25px;
+      line-height: 1.25;
+    }}
+    .subtext {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 14px;
+    }}
+    .access {{
+      max-width: 380px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      text-align: right;
+    }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      margin-bottom: 14px;
+    }}
+    .notice {{
+      margin: 0 0 12px;
+      padding: 11px 13px;
+      border-radius: 8px;
+      line-height: 1.6;
+      font-weight: 800;
+    }}
+    .notice.success {{
+      color: var(--success);
+      background: #e8f5ee;
+      border: 1px solid #bbdec9;
+    }}
+    .notice.error {{
+      color: var(--danger);
+      background: #fff0ee;
+      border: 1px solid #f3c3bd;
+    }}
+    .toolbar {{
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: start;
+    }}
+    .sheet-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .sheet-tab {{
+      display: inline-flex;
+      align-items: center;
+      min-height: 32px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #bdd9cd;
+      background: #eef6f1;
+      color: #0c4f47;
+      text-decoration: none;
+      font-weight: 800;
+      cursor: pointer;
+    }}
+    .sheet-tab.active {{
+      background: #136f63;
+      color: #fff;
+      border-color: #136f63;
+    }}
+    .controls {{
+      display: grid;
+      grid-template-columns: repeat(5, auto);
+      gap: 8px;
+      align-items: end;
+      justify-content: end;
+    }}
+    label {{
+      display: grid;
+      gap: 5px;
+      font-weight: 800;
+      font-size: 13px;
+    }}
+    input, select, button, .button {{
+      min-height: 38px;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      padding: 8px 10px;
+      font: inherit;
+    }}
+    button, .button {{
+      border: 0;
+      cursor: pointer;
+      font-weight: 800;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }}
+    .primary {{
+      background: var(--accent);
+      color: #fff;
+    }}
+    .secondary {{
+      background: #e9f3ee;
+      color: var(--accent-dark);
+      border: 1px solid #bdd9cd;
+    }}
+    .meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.5;
+    }}
+    .meta strong {{
+      color: var(--text);
+    }}
+    .grid-wrap {{
+      overflow: auto;
+      max-height: 74vh;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }}
+    table {{
+      border-collapse: collapse;
+      min-width: 100%;
+      font-size: 12px;
+    }}
+    th, td {{
+      border: 1px solid #d7ddd4;
+      padding: 0;
+      white-space: nowrap;
+      min-width: 78px;
+      max-width: 240px;
+      vertical-align: middle;
+    }}
+    thead th {{
+      position: sticky;
+      top: 0;
+      background: #e8efe9;
+      z-index: 2;
+      padding: 6px 8px;
+      text-align: center;
+    }}
+    tbody th {{
+      position: sticky;
+      left: 0;
+      z-index: 1;
+      background: #e8efe9;
+      padding: 6px 8px;
+      text-align: center;
+      min-width: 56px;
+    }}
+    .corner {{
+      position: sticky;
+      top: 0;
+      left: 0;
+      z-index: 3;
+    }}
+    .cell {{
+      display: block;
+      width: 100%;
+      min-height: 30px;
+      padding: 6px 8px;
+      border: 0;
+      background: transparent;
+      font: inherit;
+      color: inherit;
+      outline: none;
+    }}
+    .editable {{
+      background: #e4f2ec;
+    }}
+    .locked {{
+      background: transparent;
+    }}
+    .dirty {{
+      box-shadow: inset 0 0 0 2px rgba(19, 111, 99, 0.35);
+    }}
+    .selected {{
+      outline: 2px solid #136f63;
+      outline-offset: -2px;
+    }}
+    .cell-text {{
+      display: block;
+      min-height: 30px;
+      padding: 6px 8px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }}
+    .hint {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    .statusline {{
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    @media (max-width: 1024px) {{
+      .toolbar, .controls {{
+        grid-template-columns: 1fr;
+      }}
+      .access {{
+        text-align: left;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="top">
+      <div>
+        <h1>在线编辑工作簿</h1>
+        <p class="subtext">当前文件：{html.escape(latest_name)}。这个页面直接读取并回写同一个 xlsx 工作簿，你可以像打开表格一样切 Sheet、跳行列、编辑绿色回填栏。</p>
+      </div>
+      <div class="access">{html.escape(storage_description())}</div>
+    </section>
+
+    {message_html}
+    {error_html}
+
+    <section class="panel">
+      <div class="toolbar">
+        <div>
+          <div id="sheet-tabs" class="sheet-tabs"></div>
+          <div class="meta">
+            <div>文件：<strong>{html.escape(latest_name)}</strong></div>
+            <div>当前 Sheet：<strong id="sheet-name">{html.escape(selected_sheet)}</strong></div>
+            <div>状态：<strong id="save-state">未修改</strong></div>
+          </div>
+        </div>
+        <div class="controls">
+          <label>起始行 <input id="start-row" type="number" min="1" value="{start_row}"></label>
+          <label>起始列 <input id="start-col" type="text" value="{html.escape(get_column_letter(start_col))}"></label>
+          <label>行数 <input id="rows-limit" type="number" min="1" max="200" value="{rows_limit}"></label>
+          <label>列数 <input id="cols-limit" type="number" min="1" max="120" value="{cols_limit}"></label>
+          <div style="display:flex; gap:8px; align-items:end;">
+            <button id="refresh-btn" class="secondary" type="button">刷新窗口</button>
+            <button id="save-btn" class="primary" type="button">保存修改</button>
+          </div>
+        </div>
+      </div>
+      <div class="hint">浅绿色单元格可编辑，其他单元格只读。这个编辑器不会把 xlsx 转成别的文件格式，保存时仍然写回原始共用销售排单。</div>
+    </section>
+
+    <section class="panel">
+      <div id="grid" class="grid-wrap"></div>
+      <div id="statusline" class="statusline">正在加载工作簿窗口…</div>
+    </section>
+  </main>
+  <script>
+    const SHEET_NAMES = {sheet_names_json};
+    const INITIAL = {initial_state_json};
+    const DEFAULT_SHEET = {current_sheet_json};
+    const dirtyCells = new Map();
+    let currentSheet = INITIAL.sheet || DEFAULT_SHEET;
+    let currentWindow = {{
+      sheet: currentSheet,
+      start_row: INITIAL.start_row,
+      start_col: INITIAL.start_col,
+      rows: INITIAL.rows,
+      cols: INITIAL.cols,
+    }};
+    let currentPayload = null;
+    let selectedCoord = "";
+
+    const grid = document.getElementById("grid");
+    const tabsEl = document.getElementById("sheet-tabs");
+    const statusEl = document.getElementById("statusline");
+    const saveStateEl = document.getElementById("save-state");
+    const sheetNameEl = document.getElementById("sheet-name");
+    const startRowEl = document.getElementById("start-row");
+    const startColEl = document.getElementById("start-col");
+    const rowsLimitEl = document.getElementById("rows-limit");
+    const colsLimitEl = document.getElementById("cols-limit");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const saveBtn = document.getElementById("save-btn");
+
+    function setStatus(text, kind = "") {{
+      statusEl.textContent = text;
+      statusEl.dataset.kind = kind;
+    }}
+
+    function updateSaveState() {{
+      const count = dirtyCells.size;
+      saveStateEl.textContent = count ? `有 ${{count}} 个单元格未保存` : "未修改";
+      saveBtn.disabled = !count;
+    }}
+
+    function makeTab(sheet) {{
+      const a = document.createElement("button");
+      a.type = "button";
+      a.className = "sheet-tab" + (sheet === currentSheet ? " active" : "");
+      a.textContent = sheet;
+      a.addEventListener("click", () => {{
+        currentSheet = sheet;
+        loadWindow({{ resetSelection: true }});
+      }});
+      return a;
+    }}
+
+    function renderTabs() {{
+      tabsEl.innerHTML = "";
+      SHEET_NAMES.forEach((sheet) => tabsEl.appendChild(makeTab(sheet)));
+    }}
+
+    function currentParams() {{
+      return {{
+        sheet: currentSheet,
+        start_row: Number(startRowEl.value || currentWindow.start_row || 1),
+        start_col: startColEl.value || "A",
+        rows: Number(rowsLimitEl.value || currentWindow.rows || 80),
+        cols: Number(colsLimitEl.value || currentWindow.cols || 40),
+      }};
+    }}
+
+    function escapeHtml(text) {{
+      return String(text ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }}
+
+    function buildGrid(payload) {{
+      currentPayload = payload;
+      currentWindow = {{
+        sheet: payload.sheet,
+        start_row: payload.start_row,
+        start_col: payload.start_col,
+        rows: payload.rows_limit,
+        cols: payload.cols_limit,
+      }};
+      sheetNameEl.textContent = payload.sheet;
+      startRowEl.value = payload.start_row;
+      startColEl.value = payload.start_col_letter;
+      rowsLimitEl.value = payload.rows_limit;
+      colsLimitEl.value = payload.cols_limit;
+
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      const corner = document.createElement("th");
+      corner.className = "corner";
+      corner.textContent = "#";
+      headRow.appendChild(corner);
+      payload.col_headers.forEach((col) => {{
+        const th = document.createElement("th");
+        th.textContent = col;
+        headRow.appendChild(th);
+      }});
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      payload.rows.forEach((row) => {{
+        const tr = document.createElement("tr");
+        const rowHeader = document.createElement("th");
+        rowHeader.textContent = row.row;
+        tr.appendChild(rowHeader);
+        row.cells.forEach((cell) => {{
+          const td = document.createElement("td");
+          if (cell.fill) td.style.background = cell.fill;
+          td.title = cell.coord;
+          if (cell.editable) {{
+            const input = document.createElement("input");
+            input.className = "cell editable";
+            input.value = cell.text || "";
+            input.dataset.coord = cell.coord;
+            input.dataset.original = cell.text || "";
+            input.dataset.sheet = payload.sheet;
+            input.addEventListener("focus", () => {{
+              selectedCoord = cell.coord;
+              highlightSelection();
+            }});
+            input.addEventListener("input", () => {{
+              const key = `${{payload.sheet}}!${{cell.coord}}`;
+              if (input.value === input.dataset.original) {{
+                dirtyCells.delete(key);
+                input.classList.remove("dirty");
+              }} else {{
+                dirtyCells.set(key, {{ sheet: payload.sheet, cell: cell.coord, value: input.value }});
+                input.classList.add("dirty");
+              }}
+              updateSaveState();
+            }});
+            input.addEventListener("keydown", (ev) => {{
+              if (ev.key === "Enter") {{
+                ev.preventDefault();
+                saveChanges();
+              }}
+            }});
+            td.appendChild(input);
+          }} else {{
+            const span = document.createElement("span");
+            span.className = "cell-text locked";
+            span.textContent = cell.text || "";
+            td.appendChild(span);
+          }}
+          td.dataset.coord = cell.coord;
+          tr.appendChild(td);
+        }});
+        tbody.appendChild(tr);
+      }});
+      table.appendChild(tbody);
+      grid.innerHTML = "";
+      grid.appendChild(table);
+      highlightSelection();
+      setStatus(`已加载 ${{payload.sheet}} 的窗口：第 ${{payload.start_row}} 行起，第 ${{payload.start_col_letter}} 列起，共 ${{payload.rows_limit}} 行 × ${{payload.cols_limit}} 列。`, "ready");
+    }}
+
+    function highlightSelection() {{
+      grid.querySelectorAll(".selected").forEach((el) => el.classList.remove("selected"));
+      if (!selectedCoord) return;
+      const el = grid.querySelector(`[data-coord="${{selectedCoord}}"]`);
+      if (el) el.classList.add("selected");
+    }}
+
+    async function loadWindow({{ resetSelection = false }}) {{
+      if (resetSelection) selectedCoord = "";
+      renderTabs();
+      const params = currentParams();
+      setStatus("正在读取工作簿窗口…");
+      const url = new URL("/api/editor/window", location.origin);
+      Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (!resp.ok) {{
+        throw new Error(data.error || "读取工作簿失败");
+      }}
+      buildGrid(data);
+      renderTabs();
+      updateSaveState();
+    }}
+
+    async function saveChanges() {{
+      if (!dirtyCells.size) return;
+      saveBtn.disabled = true;
+      setStatus("正在保存修改…");
+      const changes = Array.from(dirtyCells.values()).map((item) => ({{
+        cell: item.cell,
+        value: item.value,
+      }}));
+      const resp = await fetch("/api/editor/save", {{
+        method: "POST",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify({{
+          sheet: currentSheet,
+          changes,
+        }}),
+      }});
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {{
+        setStatus(data.error || "保存失败", "error");
+        saveBtn.disabled = false;
+        return;
+      }}
+      dirtyCells.clear();
+      updateSaveState();
+      setStatus(`已保存 ${{data.saved_count || changes.length}} 个单元格。`, "success");
+      await loadWindow({{ resetSelection: false }});
+    }}
+
+    refreshBtn.addEventListener("click", () => loadWindow({{ resetSelection: false }}));
+    saveBtn.addEventListener("click", () => saveChanges());
+
+    window.addEventListener("beforeunload", (ev) => {{
+      if (dirtyCells.size) {{
+        ev.preventDefault();
+        ev.returnValue = "";
+      }}
+    }});
+
+    renderTabs();
+    loadWindow({{ resetSelection: true }}).catch((err) => {{
+      console.error(err);
+      setStatus(err.message || "加载失败", "error");
+    }});
+  </script>
+</body>
+</html>
+"""
+    return page.encode("utf-8")
+
+
+def read_json_body(handler: BaseHTTPRequestHandler) -> dict:
+    content_length = int(handler.headers.get("Content-Length", "0") or "0")
+    if content_length <= 0:
+        return {}
+    body = handler.rfile.read(content_length).decode("utf-8")
+    if not body.strip():
+        return {}
+    return json.loads(body)
+
+
+def handle_editor_window(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
+    try:
+        if not master_sales_exists():
+            raise ValueError("还没有共用销售排单可预览，请先上传本周排单。")
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query)
+        sheet_name = (query.get("sheet", [""])[0] or "").strip()
+        try:
+            start_row = int(query.get("start_row", ["1"])[0])
+        except ValueError:
+            start_row = 1
+        start_col = parse_column_ref(query.get("start_col", ["1"])[0], default=1)
+        try:
+            rows_limit = int(query.get("rows", ["80"])[0])
+        except ValueError:
+            rows_limit = 80
+        try:
+            cols_limit = int(query.get("cols", ["40"])[0])
+        except ValueError:
+            cols_limit = 40
+        with STATE_LOCK:
+            wb = load_workbook(MASTER_SALES_PATH, read_only=True, data_only=True)
+            try:
+                payload = editor_window_payload(wb, sheet_name or wb.sheetnames[0], start_row, start_col, rows_limit, cols_limit)
+            finally:
+                wb.close()
+        write_json(handler, 200, payload, head=head)
+    except Exception as exc:  # noqa: BLE001
+        write_json(handler, 400, {"ok": False, "error": str(exc)}, head=head)
+
+
+def handle_editor_save(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
+    try:
+        if job_is_running():
+            raise ValueError("当前有预测正在后台回填，请处理完成后再编辑工作簿。")
+        if not master_sales_exists():
+            raise ValueError("还没有共用销售排单可编辑，请先上传本周排单。")
+
+        payload = read_json_body(handler)
+        sheet_name = (payload.get("sheet") or "").strip()
+        changes = payload.get("changes") or []
+        if not sheet_name:
+            raise ValueError("缺少 Sheet 名称。")
+        if not isinstance(changes, list):
+            raise ValueError("修改数据格式不正确。")
+        if not changes:
+            write_json(handler, 200, {"ok": True, "saved_count": 0}, head=head)
+            return
+
+        saved_count = 0
+        with STATE_LOCK:
+            wb = load_workbook(MASTER_SALES_PATH)
+            try:
+                if sheet_name not in wb.sheetnames:
+                    raise ValueError(f"没有找到 Sheet：{sheet_name}")
+                editable_columns = editable_forecast_columns(wb, sheet_name)
+                ws = wb[sheet_name]
+                for item in changes:
+                    cell = str(item.get("cell") or "").strip().upper().replace(" ", "")
+                    raw_value = str(item.get("value") or "")
+                    cell_match = re.fullmatch(r"([A-Z]{1,3})([1-9][0-9]{0,6})", cell)
+                    if not cell_match:
+                        raise ValueError(f"单元格格式不正确：{cell}")
+                    cell_col = column_index_from_string(cell_match.group(1))
+                    cell_row = int(cell_match.group(2))
+                    if cell_row < DATA_START_ROW or cell_col not in editable_columns:
+                        raise ValueError(f"{cell} 属于原始数据或历史区域，不能在线修改。")
+                    ws[cell].value = parse_editable_forecast_value(raw_value)
+                    saved_count += 1
+                wb.save(MASTER_SALES_PATH)
+                shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+                sync_master_files_to_remote()
+                metadata = ensure_metadata_schema(load_metadata())
+                metadata["last_manual_edit_at"] = now_label()
+                metadata["last_manual_edit_cell"] = f"{sheet_name}!{changes[-1].get('cell', '')}"
+                metadata["last_updated_rows"] = str(saved_count)
+                save_metadata(metadata)
+            finally:
+                wb.close()
+
+        write_json(handler, 200, {"ok": True, "saved_count": saved_count}, head=head)
+    except Exception as exc:  # noqa: BLE001
+        write_json(handler, 400, {"ok": False, "error": str(exc)}, head=head)
+
+
 def handle_edit_cell(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
     selected_sheet = ""
     try:
@@ -1982,7 +2739,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_html(
                 self,
                 200,
-                render_preview_page(
+                render_workbook_editor_page(
                     selected_sheet=selected_sheet,
                     start_row=start_row,
                     start_col=start_col,
@@ -1991,6 +2748,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                     full_view=full_view,
                 ).decode("utf-8"),
             )
+            return
+
+        if path == "/api/editor/window":
+            handle_editor_window(self)
             return
 
         if path == "/healthz":
@@ -2064,7 +2825,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             write_html(
                 self,
                 200,
-                render_preview_page(
+                render_workbook_editor_page(
                     selected_sheet=selected_sheet,
                     start_row=start_row,
                     start_col=start_col,
@@ -2074,6 +2835,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                 ).decode("utf-8"),
                 head=True,
             )
+            return
+
+        if path == "/api/editor/window":
+            handle_editor_window(self, head=True)
             return
 
         if path == "/status":
@@ -2093,6 +2858,9 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/editor/save":
+            handle_editor_save(self)
+            return
         if parsed.path == "/sales-master":
             handle_sales_master(self)
             return
