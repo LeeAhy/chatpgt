@@ -1341,6 +1341,8 @@ def render_preview_page(
     cols_limit: int = 140,
     full_view: bool = False,
 ) -> bytes:
+    FULL_VIEW_ROW_CAP = 120
+    FULL_VIEW_COL_CAP = 80
     if not master_sales_exists():
         return render_page(error="还没有共用销售排单可预览，请先上传本周排单。")
 
@@ -1366,12 +1368,12 @@ def render_preview_page(
         sheet_max_row = max(int(ws.max_row or 1), 1)
         sheet_max_col = max(int(ws.max_column or 1), 1)
         if full_view:
-            start_row = 1
-            start_col = 1
-            rows_limit = sheet_max_row
-            cols_limit = sheet_max_col
-            max_row = sheet_max_row
-            max_col = sheet_max_col
+            start_row = min(start_row, sheet_max_row)
+            start_col = min(start_col, sheet_max_col)
+            rows_limit = min(max(rows_limit, 20), FULL_VIEW_ROW_CAP)
+            cols_limit = min(max(cols_limit, 40), FULL_VIEW_COL_CAP)
+            max_row = min(sheet_max_row, start_row + rows_limit - 1)
+            max_col = min(sheet_max_col, start_col + cols_limit - 1)
         else:
             start_row = min(start_row, sheet_max_row)
             start_col = min(start_col, sheet_max_col)
@@ -1558,7 +1560,7 @@ def render_preview_page(
     </section>
     <section class="panel">
       <div class="sheet-tabs">{sheet_tab_html}</div>
-      <p class="subtext">可在线修改范围：{html.escape(editable_summary)}。浅绿色单元格为可编辑本周预估栏；其它单元格为原始/历史/差异数据，只能查看，不能修改。{f"当前为整表模式，已展开到 {sheet_max_row} 行 × {sheet_max_col} 列。" if full_view else "如果要一次查看整张工作表，可点击“整表模式”。"}</p>
+      <p class="subtext">可在线修改范围：{html.escape(editable_summary)}。浅绿色单元格为可编辑本周预估栏；其它单元格为原始/历史/差异数据，只能查看，不能修改。{f"当前为整表浏览模式，已打开 {min(rows_limit, FULL_VIEW_ROW_CAP)} 行 × {min(cols_limit, FULL_VIEW_COL_CAP)} 列的窗口，可继续用起始行/列向后翻。" if full_view else "如果要像整张工作簿一样浏览，请点击“整表模式”。"}</p>
     </section>
     <div class="table-wrap">
       <table>
