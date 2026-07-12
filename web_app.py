@@ -514,7 +514,7 @@ def render_page(
         '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
     )
     preview_latest_html = (
-        '<a class="secondary button" href="/preview">打开 xlsx 编辑器</a>' if has_master else ""
+        '<a class="secondary button" href="/preview">在网站里打开表格</a>' if has_master else ""
     )
     state_text = (
         f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
@@ -1420,7 +1420,6 @@ def render_preview_page(
         if selected_sheet not in sheet_names:
             selected_sheet = sheet_names[0]
         ws = wb[selected_sheet]
-        editable_columns = editable_forecast_columns(wb, selected_sheet)
         sheet_max_row = max(int(ws.max_row or 1), 1)
         sheet_max_col = max(int(ws.max_column or 1), 1)
         if full_view:
@@ -1435,12 +1434,6 @@ def render_preview_page(
             start_col = min(start_col, sheet_max_col)
             max_row = min(sheet_max_row, start_row + rows_limit - 1)
             max_col = min(sheet_max_col, start_col + cols_limit - 1)
-        editable_labels = sorted(set(editable_columns.values()))
-        editable_summary = "、".join(editable_labels[:8])
-        if len(editable_labels) > 8:
-            editable_summary += f" 等 {len(editable_labels)} 类"
-        if not editable_summary:
-            editable_summary = "当前 Sheet 没有识别到可在线修改的本周预估栏"
         sheet_tab_html = "\n".join(
             (
                 f'<a class="sheet-tab {"active" if name == selected_sheet else ""}" '
@@ -1457,36 +1450,19 @@ def render_preview_page(
         header_cells = "".join(f"<th>{get_column_letter(col)}</th>" for col in range(start_col, max_col + 1))
         body_rows = []
         for row_idx, row_values in enumerate(
-            ws.iter_rows(min_row=start_row, max_row=max_row, min_col=start_col, max_col=max_col, values_only=True),
+            ws.iter_rows(min_row=start_row, max_row=max_row, min_col=start_col, max_col=max_col, values_only=False),
             start=start_row,
         ):
             cells = [f"<th>{row_idx}</th>"]
-            for col_idx, value in enumerate(row_values, start=start_col):
+            for col_idx, cell in enumerate(row_values, start=start_col):
+                value = cell.value
                 display = "" if value is None else str(value)
                 if len(display) > 80:
                     display = display[:77] + "..."
                 coord = f"{get_column_letter(col_idx)}{row_idx}"
-                editable_label = editable_columns.get(col_idx) if row_idx >= DATA_START_ROW else None
-                if editable_label:
-                    cells.append(
-                        '<td class="editable-cell" '
-                        f'title="{html.escape(coord)}：{html.escape(editable_label)}">'
-                        '<form class="cell-form" method="post" action="/edit-cell">'
-                        f'<input type="hidden" name="sheet" value="{html.escape(selected_sheet)}">'
-                        f'<input type="hidden" name="cell" value="{html.escape(coord)}">'
-                        f'<input type="hidden" name="start_row" value="{start_row}">'
-                        f'<input type="hidden" name="start_col" value="{start_col}">'
-                        f'<input type="hidden" name="rows" value="{rows_limit}">'
-                        f'<input type="hidden" name="cols" value="{cols_limit}">'
-                        f'<input type="hidden" name="full" value="{1 if full_view else 0}">'
-                        f'<input class="cell-input" name="value" value="{html.escape(display)}" '
-                        f'aria-label="{html.escape(coord)}">'
-                        '<button class="cell-save" type="submit">保存</button>'
-                        '</form>'
-                        '</td>'
-                    )
-                else:
-                    cells.append(f'<td title="{html.escape(coord)}">{html.escape(display)}</td>')
+                fill_css = fill_css_from_cell(cell)
+                style_attr = f' style="background:{fill_css}"' if fill_css else ""
+                cells.append(f'<td{style_attr} title="{html.escape(coord)}">{html.escape(display)}</td>')
             body_rows.append("<tr>" + "".join(cells) + "</tr>")
         table_html = "\n".join(body_rows)
     finally:
@@ -1498,7 +1474,7 @@ def render_preview_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>在线预览</title>
+  <title>网站内打开表格</title>
   <style>
     :root {{
       --paper: #f6f7f4;
@@ -1559,32 +1535,14 @@ def render_preview_page(
       color: #fff;
       border-color: #136f63;
     }}
-    .editable-cell {{ background: #e4f2ec; padding: 2px; }}
-    .cell-form {{ display: flex; flex-wrap: nowrap; gap: 3px; align-items: center; }}
-    .cell-input {{
-      width: 82px;
-      min-height: 26px;
-      padding: 3px 5px;
-      border-color: #9fcfbb;
-      background: #fbfffd;
-      font-size: 12px;
-    }}
-    .cell-save {{
-      min-height: 26px;
-      padding: 3px 6px;
-      border-radius: 5px;
-      color: #fff;
-      background: var(--accent);
-      font-size: 12px;
-    }}
   </style>
 </head>
 <body>
   <main class="shell">
     <div class="top">
       <div>
-        <h1>在线预览当前最新版</h1>
-        <p class="subtext">当前文件：{html.escape(latest_name)}。可以整张表查看和下载；系统仍只允许修改浅绿色可回填栏，原始黄底和历史数据列保持只读。</p>
+        <h1>网站内打开当前表格</h1>
+        <p class="subtext">当前文件：{html.escape(latest_name)}。这里直接在网站里打开你上传的共用销售排单，按 Sheet 查看，不进入 xlsx 编辑器。</p>
       </div>
       <a class="secondary button" href="/">返回上传页</a>
     </div>
@@ -1616,7 +1574,7 @@ def render_preview_page(
     </section>
     <section class="panel">
       <div class="sheet-tabs">{sheet_tab_html}</div>
-      <p class="subtext">可在线修改范围：{html.escape(editable_summary)}。浅绿色单元格为可编辑本周预估栏；其它单元格为原始/历史/差异数据，只能查看，不能修改。{f"当前为整表浏览模式，已打开 {min(rows_limit, FULL_VIEW_ROW_CAP)} 行 × {min(cols_limit, FULL_VIEW_COL_CAP)} 列的窗口，可继续用起始行/列向后翻。" if full_view else "如果要像整张工作簿一样浏览，请点击“整表模式”。"}</p>
+      <p class="subtext">{f"当前为整表浏览模式，已打开 {min(rows_limit, FULL_VIEW_ROW_CAP)} 行 × {min(cols_limit, FULL_VIEW_COL_CAP)} 列的窗口，可继续用起始行/列向后翻。" if full_view else "当前为窗口浏览模式；如果要像整张工作簿一样查看，请点击“整表模式”。"} 颜色和内容都按上传表格直接展示。</p>
     </section>
     <div class="table-wrap">
       <table>
@@ -3314,11 +3272,12 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                 cols_limit = int(query.get("cols", ["140"])[0])
             except ValueError:
                 cols_limit = 140
-            full_view = (query.get("full", ["0"])[0] or "0").strip() in {"1", "true", "yes", "on"}
+            full_default = "1" if not query else "0"
+            full_view = (query.get("full", [full_default])[0] or full_default).strip() in {"1", "true", "yes", "on"}
             write_html(
                 self,
                 200,
-                render_workbook_editor_page(
+                render_preview_page(
                     selected_sheet=selected_sheet,
                     start_row=start_row,
                     start_col=start_col,
@@ -3404,11 +3363,12 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                 cols_limit = int(query.get("cols", ["140"])[0])
             except ValueError:
                 cols_limit = 140
-            full_view = (query.get("full", ["0"])[0] or "0").strip() in {"1", "true", "yes", "on"}
+            full_default = "1" if not query else "0"
+            full_view = (query.get("full", [full_default])[0] or full_default).strip() in {"1", "true", "yes", "on"}
             write_html(
                 self,
                 200,
-                render_workbook_editor_page(
+                render_preview_page(
                     selected_sheet=selected_sheet,
                     start_row=start_row,
                     start_col=start_col,
