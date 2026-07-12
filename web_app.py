@@ -1437,7 +1437,7 @@ def render_preview_page(
         sheet_tab_html = "\n".join(
             (
                 f'<a class="sheet-tab {"active" if name == selected_sheet else ""}" '
-                f'href="/preview?sheet={urllib.parse.quote(name)}&start_row={start_row}&start_col={get_column_letter(start_col)}'
+                f'href="/table-preview?sheet={urllib.parse.quote(name)}&start_row={start_row}&start_col={get_column_letter(start_col)}'
                 f'&rows={rows_limit}&cols={cols_limit}{"&full=1" if full_view else ""}">'
                 f'{html.escape(name)}</a>'
             )
@@ -1549,7 +1549,7 @@ def render_preview_page(
     {message_html}
     {error_html}
     <section class="panel">
-      <form method="get" action="/preview">
+      <form method="get" action="/table-preview">
         <label>选择 Sheet
           <select name="sheet">{sheet_options}</select>
         </label>
@@ -1568,8 +1568,8 @@ def render_preview_page(
         <input type="hidden" name="full" value="{1 if full_view else 0}">
         <button class="primary" type="submit">刷新预览</button>
         <a class="secondary button" href="/download/latest">下载当前最新版</a>
-        <a class="secondary button" href="/preview?sheet={urllib.parse.quote(selected_sheet)}&full=1">整表模式</a>
-        <a class="secondary button" href="/preview?sheet={urllib.parse.quote(selected_sheet)}&start_row=1&start_col=A&rows=80&cols=140">窗口模式</a>
+        <a class="secondary button" href="/table-preview?sheet={urllib.parse.quote(selected_sheet)}&full=1">整表模式</a>
+        <a class="secondary button" href="/table-preview?sheet={urllib.parse.quote(selected_sheet)}&start_row=1&start_col=A&rows=80&cols=140">窗口模式</a>
       </form>
     </section>
     <section class="panel">
@@ -1697,7 +1697,7 @@ def render_onlyoffice_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>共用销售排单 xlsx 编辑器</title>
+  <title>网站内直接打开 xlsx</title>
   <style>
     :root {{
       --paper: #f3f6f1;
@@ -1795,8 +1795,8 @@ def render_onlyoffice_page(
   <main class="shell">
     <section class="top">
       <div>
-        <h1>共用销售排单 xlsx 编辑器</h1>
-        <p class="subtext">这里直接打开并编辑原始 xlsx 文件。保存后会自动回写到当前共用排单，不会转换成别的格式。</p>
+        <h1>网站内直接打开 xlsx</h1>
+        <p class="subtext">这里直接打开并编辑原始 xlsx 文件。页面里看到的就是在线表格，保存后会自动回写到当前共用排单，不会转换成别的格式。</p>
       </div>
       <div class="meta">
         <div>当前文件：{html.escape(latest_name)}</div>
@@ -1812,7 +1812,7 @@ def render_onlyoffice_page(
       <div id="onlyoffice-editor"></div>
     </section>
 
-    <div class="hint">如果编辑器无法显示，请确认当前网站是通过 Render 的公网地址打开，而不是本机 127.0.0.1。</div>
+    <div class="hint">如果在线表格暂时没有显示，请确认当前网站是通过 Render 的公网地址打开，而不是本机 127.0.0.1。也可以先用 <a href="/table-preview">网页浏览模式</a> 查看当前表格。</div>
   </main>
   <script>
     const config = {editor_config_json};
@@ -3258,6 +3258,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/preview":
+            write_html(self, 200, render_onlyoffice_page(handler=self).decode("utf-8"))
+            return
+
+        if path == "/table-preview":
             selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
             try:
                 start_row = int(query.get("start_row", ["1"])[0])
@@ -3349,6 +3353,10 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/preview":
+            write_html(self, 200, render_onlyoffice_page(handler=self).decode("utf-8"), head=True)
+            return
+
+        if path == "/table-preview":
             selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
             try:
                 start_row = int(query.get("start_row", ["1"])[0])
