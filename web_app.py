@@ -75,8 +75,8 @@ JOB_STATUS = {
 OWNER_GUIDES = {
     "洪鸣": "读取预测文件中的 New part NO 匹配销售排单“客户机种”。",
     "李玎玲": "优先识别截图里的“机种名”和 6-10 月预测数量，自动匹配销售排单“客户机种”；数量单位 K 会自动换算成万 pcs。",
-    "周文龙": "读取预测文件中的“品名”匹配销售排单“客户机种”。",
-    "王永仁": "读取预测文件中的“子件描述”前缀匹配销售排单“客户机种”。",
+    "周文龙": "读取预测文件中的“品名”匹配销售排单“客户机种”；允许唯一、可信的缩写或近似机种匹配。",
+    "王永仁": "读取预测文件中的“子件描述”前缀匹配销售排单“客户机种”；允许唯一版本升级和可信近似机种匹配。",
     "叶振华": "读取预测文件中的“模组型号”或“料号”匹配销售排单“客户机种”。",
     "李海鹰": "读取预测文件中的“料号”匹配销售排单“客户机种”。",
 }
@@ -515,9 +515,7 @@ def render_page(
     download_latest_html = (
         '<a class="secondary button" href="/download/latest">下载当前最新版</a>' if has_master else ""
     )
-    preview_latest_html = (
-        '<a class="secondary button" href="/preview">在网站里打开表格</a>' if has_master else ""
-    )
+    preview_latest_html = ""
     state_text = (
         f"当前共用排单：{master_name}（{format_file_size(MASTER_SALES_PATH)}）"
         if has_master
@@ -599,18 +597,20 @@ def render_page(
   <title>销售排单回填工作台</title>
   <style>
     :root {{
-      color-scheme: light;
-      --paper: #f6f7f4;
-      --panel: #ffffff;
-      --line: #d8ded5;
-      --text: #17211b;
-      --muted: #5f6b63;
-      --accent: #136f63;
-      --accent-dark: #0c4f47;
-      --warn: #8a5800;
-      --danger: #b42318;
-      --success: #126b45;
-      --shadow: 0 16px 34px rgba(28, 43, 34, 0.08);
+      color-scheme: dark;
+      --paper: #020914;
+      --panel: #071522;
+      --panel-raised: #0a1b2a;
+      --line: #20384a;
+      --line-bright: #2b4d62;
+      --text: #edf8f7;
+      --muted: #91a6b4;
+      --accent: #16c7ba;
+      --accent-dark: #6cf0e5;
+      --warn: #f5a524;
+      --danger: #ff746c;
+      --success: #35d48d;
+      --shadow: 0 20px 50px rgba(0, 0, 0, 0.36);
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -619,10 +619,12 @@ def render_page(
       color: var(--text);
       font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", -apple-system, BlinkMacSystemFont, sans-serif;
       background:
-        linear-gradient(90deg, rgba(19, 111, 99, 0.06) 1px, transparent 1px),
-        linear-gradient(180deg, rgba(138, 88, 0, 0.05) 1px, transparent 1px),
+        radial-gradient(circle at 84% 0%, rgba(22, 199, 186, 0.12), transparent 30rem),
+        radial-gradient(circle at 8% 42%, rgba(20, 102, 161, 0.10), transparent 34rem),
+        linear-gradient(90deg, rgba(67, 103, 126, 0.08) 1px, transparent 1px),
+        linear-gradient(180deg, rgba(67, 103, 126, 0.08) 1px, transparent 1px),
         var(--paper);
-      background-size: 28px 28px;
+      background-size: auto, auto, 32px 32px, 32px 32px, auto;
     }}
     a {{ color: inherit; }}
     .shell {{
@@ -637,6 +639,16 @@ def render_page(
       align-items: flex-start;
       padding: 14px 0 18px;
       border-bottom: 1px solid var(--line);
+      position: relative;
+    }}
+    .topline::after {{
+      content: "";
+      position: absolute;
+      left: 0;
+      bottom: -1px;
+      width: 128px;
+      height: 2px;
+      background: linear-gradient(90deg, var(--accent), transparent);
     }}
     h1 {{
       margin: 0 0 6px;
@@ -669,7 +681,7 @@ def render_page(
     .summary-item {{
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 12px;
       box-shadow: var(--shadow);
     }}
     .rail {{
@@ -692,16 +704,17 @@ def render_page(
       align-items: center;
       min-height: 38px;
       padding: 9px 10px;
-      border-radius: 6px;
+      border-radius: 8px;
       text-decoration: none;
       color: var(--text);
       border: 1px solid transparent;
       font-weight: 700;
     }}
     .owner-link.active {{
-      color: var(--accent-dark);
-      background: #e9f3ee;
-      border-color: #bcd8cc;
+      color: #dffffb;
+      background: linear-gradient(90deg, rgba(22, 199, 186, 0.22), rgba(22, 199, 186, 0.06));
+      border-color: rgba(22, 199, 186, 0.56);
+      box-shadow: inset 3px 0 0 var(--accent);
     }}
     .panel {{
       padding: 20px;
@@ -724,36 +737,39 @@ def render_page(
       align-items: center;
       min-height: 32px;
       padding: 6px 10px;
-      border-radius: 6px;
-      background: #f3ead8;
+      border-radius: 999px;
+      background: rgba(245, 165, 36, 0.13);
+      border: 1px solid rgba(245, 165, 36, 0.32);
       color: var(--warn);
       font-weight: 800;
       white-space: nowrap;
     }}
     .badge.ready {{
-      background: #e8f5ee;
+      background: rgba(53, 212, 141, 0.12);
+      border-color: rgba(53, 212, 141, 0.3);
       color: var(--success);
     }}
     .badge.empty {{
-      background: #fff0ee;
+      background: rgba(255, 116, 108, 0.12);
+      border-color: rgba(255, 116, 108, 0.30);
       color: var(--danger);
     }}
     .notice {{
       margin: 0 0 14px;
       padding: 12px 14px;
-      border-radius: 8px;
+      border-radius: 10px;
       border: 1px solid transparent;
       line-height: 1.6;
       font-weight: 700;
     }}
     .notice.success {{
-      background: #e8f5ee;
-      border-color: #bbdec9;
+      background: rgba(53, 212, 141, 0.10);
+      border-color: rgba(53, 212, 141, 0.32);
       color: var(--success);
     }}
     .notice.working {{
-      background: #fff8e6;
-      border-color: #efd596;
+      background: rgba(245, 165, 36, 0.10);
+      border-color: rgba(245, 165, 36, 0.34);
       color: var(--warn);
     }}
     .progress-track {{
@@ -761,13 +777,14 @@ def render_page(
       margin-top: 10px;
       overflow: hidden;
       border-radius: 999px;
-      background: rgba(138, 88, 0, 0.16);
+      background: rgba(255, 255, 255, 0.08);
     }}
     .progress-track span {{
       display: block;
       height: 100%;
       border-radius: inherit;
-      background: linear-gradient(90deg, #136f63, #d18b00);
+      background: linear-gradient(90deg, #10bfb1, #42e3d6);
+      box-shadow: 0 0 18px rgba(22, 199, 186, 0.45);
       transition: width 0.25s ease;
     }}
     .progress-note {{
@@ -777,8 +794,8 @@ def render_page(
       font-weight: 600;
     }}
     .notice.error {{
-      background: #fff0ee;
-      border-color: #f3c3bd;
+      background: rgba(255, 116, 108, 0.10);
+      border-color: rgba(255, 116, 108, 0.34);
       color: var(--danger);
     }}
     form {{
@@ -800,11 +817,22 @@ def render_page(
       width: 100%;
       min-height: 44px;
       border: 1px solid var(--line);
-      border-radius: 7px;
-      background: #fff;
+      border-radius: 9px;
+      background: #06121e;
       padding: 10px 12px;
       font: inherit;
       color: var(--text);
+    }}
+    input[type="file"]::file-selector-button {{
+      margin-right: 12px;
+      padding: 8px 12px;
+      border: 1px solid rgba(22, 199, 186, 0.34);
+      border-radius: 7px;
+      color: #b8f8f2;
+      background: rgba(22, 199, 186, 0.10);
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
     }}
     .hint {{
       margin-top: 7px;
@@ -816,9 +844,9 @@ def render_page(
       display: grid;
       gap: 8px;
       padding: 12px 14px;
-      border: 1px solid #cfe0d7;
-      border-radius: 8px;
-      background: #f4faf7;
+      border: 1px solid rgba(22, 199, 186, 0.30);
+      border-radius: 10px;
+      background: linear-gradient(135deg, rgba(22, 199, 186, 0.10), rgba(7, 21, 34, 0.75));
       color: var(--accent-dark);
       line-height: 1.55;
       font-size: 14px;
@@ -834,16 +862,16 @@ def render_page(
       padding: 18px;
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
+      border-radius: 12px;
       box-shadow: var(--shadow);
     }}
     .master-card {{
       display: grid;
       gap: 10px;
       padding: 14px;
-      border: 1px solid #cfe0d7;
-      border-radius: 8px;
-      background: #f8fbf8;
+      border: 1px solid rgba(22, 199, 186, 0.28);
+      border-radius: 10px;
+      background: linear-gradient(145deg, rgba(10, 27, 42, 0.98), rgba(5, 17, 28, 0.98));
     }}
     .master-top {{
       display: flex;
@@ -877,9 +905,9 @@ def render_page(
       gap: 4px;
       min-height: 92px;
       padding: 12px;
-      border-radius: 8px;
+      border-radius: 10px;
       border: 1px solid var(--line);
-      background: #fff;
+      background: rgba(8, 24, 38, 0.86);
     }}
     .owner-status strong {{
       font-size: 15px;
@@ -892,7 +920,8 @@ def render_page(
       font-size: 12px;
       font-weight: 900;
       color: var(--muted);
-      background: #eef1ec;
+      background: rgba(145, 166, 180, 0.13);
+      border: 1px solid rgba(145, 166, 180, 0.20);
     }}
     .owner-status small {{
       color: var(--muted);
@@ -900,15 +929,15 @@ def render_page(
     }}
     .owner-status.running span {{
       color: var(--warn);
-      background: #fff4d7;
+      background: rgba(245, 165, 36, 0.13);
     }}
     .owner-status.done span {{
       color: var(--success);
-      background: #e8f5ee;
+      background: rgba(53, 212, 141, 0.13);
     }}
     .owner-status.error span {{
       color: var(--danger);
-      background: #fff0ee;
+      background: rgba(255, 116, 108, 0.13);
     }}
     .actions {{
       display: flex;
@@ -921,20 +950,21 @@ def render_page(
     .button {{
       min-height: 44px;
       border: 0;
-      border-radius: 7px;
+      border-radius: 9px;
       padding: 11px 16px;
       font: inherit;
       font-weight: 800;
       cursor: pointer;
     }}
     .primary {{
-      color: #fff;
-      background: var(--accent);
+      color: #001713;
+      background: linear-gradient(135deg, #35ded0, #12b8ac);
+      box-shadow: 0 8px 24px rgba(22, 199, 186, 0.22);
     }}
     .secondary {{
-      color: var(--accent-dark);
-      background: #e9f3ee;
-      border: 1px solid #bdd9cd;
+      color: #b8f8f2;
+      background: rgba(22, 199, 186, 0.08);
+      border: 1px solid rgba(22, 199, 186, 0.36);
       text-decoration: none;
       display: inline-flex;
       align-items: center;
@@ -948,6 +978,7 @@ def render_page(
     .summary-item {{
       padding: 14px;
       box-shadow: none;
+      background: linear-gradient(145deg, rgba(9, 25, 39, 0.96), rgba(5, 17, 28, 0.96));
     }}
     .summary-item strong {{
       display: block;
@@ -990,7 +1021,7 @@ def render_page(
     <section class="topline">
       <div>
         <h1>销售排单回填工作台</h1>
-        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；系统会自动扫描销售排单里当前空白的“预估”数量/金额栏，并按栏位对应的月份匹配预测文件中的月份数量后回填。</p>
+        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；系统只补充当前空白的“预估”数量/金额栏，未匹配机种保持空白，其他原始数据不修改。</p>
       </div>
       <div class="access">{html.escape(access_note)}</div>
     </section>
@@ -3280,46 +3311,33 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/preview":
-            write_html(self, 200, render_onlyoffice_page(handler=self).decode("utf-8"))
+            write_html(
+                self,
+                404,
+                render_page(
+                    error="在线预览和编辑功能已暂时关闭，请下载当前最新版查看。",
+                    handler=self,
+                ).decode("utf-8"),
+            )
             return
 
         if path == "/table-preview":
-            selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
-            try:
-                start_row = int(query.get("start_row", ["1"])[0])
-            except ValueError:
-                start_row = 1
-            start_col = parse_column_ref(query.get("start_col", ["1"])[0], default=1)
-            try:
-                rows_limit = int(query.get("rows", ["80"])[0])
-            except ValueError:
-                rows_limit = 80
-            try:
-                cols_limit = int(query.get("cols", ["140"])[0])
-            except ValueError:
-                cols_limit = 140
-            full_default = "1" if not query else "0"
-            full_view = (query.get("full", [full_default])[0] or full_default).strip() in {"1", "true", "yes", "on"}
             write_html(
                 self,
-                200,
-                render_preview_page(
-                    selected_sheet=selected_sheet,
-                    start_row=start_row,
-                    start_col=start_col,
-                    rows_limit=rows_limit,
-                    cols_limit=cols_limit,
-                    full_view=full_view,
+                404,
+                render_page(
+                    error="在线预览和编辑功能已暂时关闭，请下载当前最新版查看。",
+                    handler=self,
                 ).decode("utf-8"),
             )
             return
 
         if path == "/api/editor/window":
-            handle_editor_window(self)
+            write_text(self, 404, "Preview and editing are temporarily disabled")
             return
 
         if path == "/api/onlyoffice/callback":
-            handle_onlyoffice_callback(self)
+            write_text(self, 404, "Preview and editing are temporarily disabled")
             return
 
         if path == "/healthz":
@@ -3375,43 +3393,15 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/preview":
-            write_html(self, 200, render_onlyoffice_page(handler=self).decode("utf-8"), head=True)
+            write_text(self, 404, "Not found", head=True)
             return
 
         if path == "/table-preview":
-            selected_sheet = query.get("sheet", [""])[0] if query.get("sheet") else ""
-            try:
-                start_row = int(query.get("start_row", ["1"])[0])
-            except ValueError:
-                start_row = 1
-            start_col = parse_column_ref(query.get("start_col", ["1"])[0], default=1)
-            try:
-                rows_limit = int(query.get("rows", ["80"])[0])
-            except ValueError:
-                rows_limit = 80
-            try:
-                cols_limit = int(query.get("cols", ["140"])[0])
-            except ValueError:
-                cols_limit = 140
-            full_default = "1" if not query else "0"
-            full_view = (query.get("full", [full_default])[0] or full_default).strip() in {"1", "true", "yes", "on"}
-            write_html(
-                self,
-                200,
-                render_preview_page(
-                    selected_sheet=selected_sheet,
-                    start_row=start_row,
-                    start_col=start_col,
-                    rows_limit=rows_limit,
-                    cols_limit=cols_limit,
-                    full_view=full_view,
-                ).decode("utf-8"),
-                head=True,
-            )
+            write_text(self, 404, "Not found", head=True)
             return
 
         if path == "/api/editor/window":
-            handle_editor_window(self, head=True)
+            write_text(self, 404, "Not found", head=True)
             return
 
         if path == "/api/onlyoffice/callback":
@@ -3436,17 +3426,17 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path == "/api/editor/save":
-            handle_editor_save(self)
+            write_text(self, 404, "Preview and editing are temporarily disabled")
             return
         if parsed.path == "/api/onlyoffice/callback":
-            handle_onlyoffice_callback(self)
+            write_text(self, 404, "Preview and editing are temporarily disabled")
             return
         if parsed.path == "/sales-master":
             handle_sales_master(self)
             return
 
         if parsed.path == "/edit-cell":
-            handle_edit_cell(self)
+            write_text(self, 404, "Preview and editing are temporarily disabled")
             return
 
         if parsed.path != "/generate":

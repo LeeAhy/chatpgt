@@ -506,6 +506,75 @@ def match_code_fuzzy(
     return None
 
 
+def match_unique_fuzzy_code(
+    text: str,
+    code_lookup: dict[str, str],
+    sorted_norms: list[str],
+    min_ratio: float,
+    min_margin: float,
+) -> Optional[str]:
+    """Return a fuzzy match only when one candidate is clearly better."""
+    exact = match_code(text, code_lookup, sorted_norms)
+    if exact:
+        return exact
+
+    haystack = normalize_code(text)
+    if len(haystack) < 6:
+        return None
+
+    scored = []
+    for norm in sorted_norms:
+        if len(norm) < 6:
+            continue
+        length_gap = abs(len(haystack) - len(norm))
+        if length_gap > max(4, int(max(len(haystack), len(norm)) * 0.3)):
+            continue
+        scored.append((SequenceMatcher(None, haystack, norm).ratio(), norm))
+
+    if not scored:
+        return None
+    scored.sort(reverse=True)
+    best_ratio, best_norm = scored[0]
+    second_ratio = scored[1][0] if len(scored) > 1 else 0.0
+    if best_ratio < min_ratio or best_ratio - second_ratio < min_margin:
+        return None
+    return code_lookup[best_norm]
+
+
+def match_wang_version_upgrade(
+    text: str,
+    code_lookup: dict[str, str],
+    sorted_norms: list[str],
+) -> Optional[str]:
+    """Match a Wang model revision only when the sales workbook has one base model."""
+    haystack = normalize_code(text)
+    version_match = re.fullmatch(r"(.+-)(\d{3})", haystack)
+    if not version_match:
+        return None
+
+    base = version_match.group(1)
+    candidates = [norm for norm in sorted_norms if re.fullmatch(re.escape(base) + r"\d{3}", norm)]
+    if len(candidates) != 1:
+        return None
+    return code_lookup[candidates[0]]
+
+
+def match_owner_fuzzy_code(
+    text: str,
+    business_owner: Optional[str],
+    code_lookup: dict[str, str],
+    sorted_norms: list[str],
+) -> Optional[str]:
+    if business_owner == "王永仁":
+        version_match = match_wang_version_upgrade(text, code_lookup, sorted_norms)
+        if version_match:
+            return version_match
+        return match_unique_fuzzy_code(text, code_lookup, sorted_norms, min_ratio=0.90, min_margin=0.08)
+    if business_owner == "周文龙":
+        return match_unique_fuzzy_code(text, code_lookup, sorted_norms, min_ratio=0.86, min_margin=0.06)
+    return None
+
+
 def infer_month_columns_from_rows(
     rows: list[list[str]],
     business_owner: Optional[str] = None,
@@ -624,8 +693,18 @@ def match_prediction_row_code(
     sorted_norms: list[str],
     force_broad_match: bool = False,
 ) -> Optional[str]:
-    for text in prediction_match_texts(row, source_cols, business_owner, force_broad_match):
+    match_texts = prediction_match_texts(row, source_cols, business_owner, force_broad_match)
+    for text in match_texts:
         code = match_code(text, code_lookup, sorted_norms)
+        if code:
+            return code
+
+    # Broad row matching is only a last-resort exact scan. Fuzzy matching a
+    # complete row could assign a forecast to an unrelated customer model.
+    if force_broad_match:
+        return None
+    for text in match_texts:
+        code = match_owner_fuzzy_code(text, business_owner, code_lookup, sorted_norms)
         if code:
             return code
     return None
@@ -1388,7 +1467,7 @@ def process_sales_workbooks(
     pred_path: Path | str = PRED_PATH,
     sales_path: Path | str = SALES_PATH,
     output_path: Path | str = OUT_PATH,
-    freeze_formulas: bool = True,
+    freeze_formulas: bool = False,
     business_owner: Optional[str] = None,
     as_of_date: Optional[date] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
@@ -1515,7 +1594,6 @@ def process_sales_workbooks(
         code_to_row = {}
         normalized_code_to_code = {}
         row_meta = {}
-        eligible_rows: dict[int, list[str]] = {}
         for row in iter_sales_data_rows(ws):
             owner = clean_text(vws.cell(row, target.owner_col).value)
             if business_owner and not owner_matches(business_owner, owner):
@@ -1531,7 +1609,6 @@ def process_sales_workbooks(
             if not row_codes:
                 continue
 
-            eligible_rows[row] = row_codes
             meta = {
                 "O": vws[f"O{row}"].value,
                 "R": vws[f"R{row}"].value,
@@ -1547,7 +1624,6 @@ def process_sales_workbooks(
                 if norm_code:
                     normalized_code_to_code[norm_code] = code
 
-        touched_rows: set[int] = set()
         for code, month_map in predictions.items():
             qty = month_map.get(target.month)
             if qty is None:
@@ -1599,8 +1675,6 @@ def process_sales_workbooks(
             amount = amount_from_previous_week(qty, previous_qty, previous_amount)
             amt_cell.value = amount
             amt_cell.number_format = "0.00"
-            touched_rows.add(row)
-
             updates.append(
                 (
                     target.sheet,
@@ -1615,33 +1689,7 @@ def process_sales_workbooks(
                 )
             )
 
-        for row, row_codes in eligible_rows.items():
-            if row in touched_rows:
-                continue
-
-            qty_cell = ws.cell(row, target.qty_col)
-            amt_cell = ws.cell(row, target.amt_col)
-            qty_has_existing_value = cell_has_existing_nonzero_value(qty_cell.value)
-            amt_has_existing_value = cell_has_existing_nonzero_value(amt_cell.value)
-            if qty_has_existing_value or amt_has_existing_value:
-                continue
-
-            qty_cell.value = 0
-            qty_cell.number_format = "0.0000"
-            amt_cell.value = 0
-            amt_cell.number_format = "0.00"
-            zero_filled_rows.append(
-                (
-                    target.sheet,
-                    row,
-                    row_codes[0],
-                    target.label,
-                    get_column_letter(target.qty_col),
-                    business_owner or clean_text(vws.cell(row, target.owner_col).value),
-                )
-            )
-
-    if not updates and not zero_filled_rows:
+    if not updates:
         warnings.append("没有找到可回填的匹配行，已生成未改动文件。")
 
     calc = getattr(sales_wb, "calculation", None)
@@ -1656,7 +1704,7 @@ def process_sales_workbooks(
 
     summary = {
         "output_path": output_path,
-        "updated_rows": len(updates) + len(zero_filled_rows),
+        "updated_rows": len(updates),
         "fallbacks": fallbacks,
         "missing_rows": missing_rows,
         "skipped_months": skipped_months,
@@ -1681,7 +1729,7 @@ def process_sales_workbooks(
             get_column_letter(target.amt_col),
         )
     print(f"updated rows: {len(updates)}")
-    print(f"total written rows including zero fills: {len(updates) + len(zero_filled_rows)}")
+    print(f"total written rows: {len(updates)}")
     print(f"fallback prices used: {len(fallbacks)}")
     for item in fallbacks[:10]:
         print("fallback", item)
@@ -1691,9 +1739,6 @@ def process_sales_workbooks(
     print(f"skipped existing forecast cells: {len(skipped_existing_values)}")
     for item in skipped_existing_values[:20]:
         print("existing", item)
-    print(f"zero-filled rows: {len(zero_filled_rows)}")
-    for item in zero_filled_rows[:20]:
-        print("zero_filled", item)
     print(f"completed deductions: {len(completed_deductions)}")
     for item in completed_deductions[:20]:
         print("completed_deduction", item)
