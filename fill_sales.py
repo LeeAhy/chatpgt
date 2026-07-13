@@ -809,9 +809,10 @@ def dedupe_unmatched_predictions(entries: Iterable[dict]) -> list[dict]:
                 quantity = round(float(qty), 4)
             except (TypeError, ValueError):
                 continue
-            previous = current["months"].get(month_key)
-            if previous is None or abs(quantity) > abs(previous):
-                current["months"][month_key] = quantity
+            current["months"][month_key] = round(
+                current["months"].get(month_key, 0.0) + quantity,
+                4,
+            )
         source = clean_text(entry.get("source"))
         if source and source not in current["sources"]:
             current["sources"].append(source)
@@ -1848,13 +1849,6 @@ def process_sales_workbooks(
                     row = code_to_row.get(matched_code)
             if row is None:
                 missing_rows.append((target.sheet, target.label, code, business_owner or "全部"))
-                append_unmatched_prediction(
-                    unmatched_predictions,
-                    code,
-                    {target.month: qty},
-                    source=f"{target.sheet} / {target.label}",
-                    reason="该月份预估栏中没有找到对应客户机种",
-                )
                 continue
 
             qty_cell = ws.cell(row, target.qty_col)

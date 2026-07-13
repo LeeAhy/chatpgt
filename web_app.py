@@ -578,12 +578,11 @@ def render_page(
     if not isinstance(selected_unmatched, list):
         selected_unmatched = []
     unmatched_row_items = []
+    unmatched_month_totals: dict[int, float] = {}
     for item in selected_unmatched:
         if not isinstance(item, dict):
             continue
         model = html.escape(str(item.get("model") or "未命名机种"))
-        source = html.escape(str(item.get("source") or "预测文件"))
-        reason = html.escape(str(item.get("reason") or "预测机种未在共用排单中找到"))
         month_parts = []
         months = item.get("months")
         if isinstance(months, dict):
@@ -599,21 +598,36 @@ def render_page(
                     qty_text = f"{qty_number:.4f}".rstrip("0").rstrip(".")
                 except (TypeError, ValueError):
                     qty_text = str(qty)
+                try:
+                    month_number = int(month)
+                    unmatched_month_totals[month_number] = round(
+                        unmatched_month_totals.get(month_number, 0.0) + float(qty),
+                        4,
+                    )
+                except (TypeError, ValueError):
+                    pass
                 month_parts.append(f"{html.escape(str(month))}月：{html.escape(qty_text)} 万pcs")
         month_text = " ｜ ".join(month_parts) or "有预测数量"
         unmatched_row_items.append(
-            f'<tr><td><strong>{model}</strong></td><td>{month_text}</td>'
-            f'<td>{source}</td><td>{reason}</td></tr>'
+            f'<tr><td><strong>{model}</strong></td><td>{month_text}</td></tr>'
         )
     if unmatched_row_items:
         unmatched_body = "".join(unmatched_row_items)
+        unmatched_total_items = []
+        for month, qty in sorted(unmatched_month_totals.items()):
+            qty_text = f"{qty:.4f}".rstrip("0").rstrip(".")
+            unmatched_total_items.append(
+                f'<div class="month-total"><span>{month}月合计</span><strong>{html.escape(qty_text)} 万pcs</strong></div>'
+            )
+        unmatched_totals_html = "".join(unmatched_total_items)
         unmatched_panel_html = (
             f'<section class="unmatched-panel" aria-label="未匹配预测列表">'
             f'<div class="unmatched-head"><div><h3>未匹配预测列表</h3>'
-            f'<p>以下 {len(unmatched_row_items)} 个机种在预测中有数量，但没有稳定匹配到共用销售排单，因此没有回填。</p></div>'
+            f'<p>以下 {len(unmatched_row_items)} 个机种在预测文件中有数量，但没有匹配到共用销售排单，因此没有回填。</p></div>'
             f'<span class="unmatched-count">{len(unmatched_row_items)} 项</span></div>'
-            f'<div class="table-scroll"><table><thead><tr><th>预测机种</th><th>月份数量</th>'
-            f'<th>来源</th><th>未回填原因</th></tr></thead><tbody>{unmatched_body}</tbody></table></div></section>'
+            f'<div class="month-totals" aria-label="未匹配预测各月合计">{unmatched_totals_html}</div>'
+            f'<div class="table-scroll"><table><thead><tr><th>预测文件机种</th><th>预测文件月份数量</th>'
+            f'</tr></thead><tbody>{unmatched_body}</tbody></table></div></section>'
         )
     elif selected_status.get("state") == "done":
         unmatched_panel_html = (
@@ -1102,6 +1116,29 @@ def render_page(
       border-color: rgba(53, 212, 141, 0.34);
       background: rgba(53, 212, 141, 0.11);
     }}
+    .month-totals {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 8px;
+      margin-top: 14px;
+    }}
+    .month-total {{
+      display: grid;
+      gap: 4px;
+      padding: 10px 12px;
+      border: 1px solid rgba(22, 199, 186, 0.24);
+      border-radius: 8px;
+      background: rgba(22, 199, 186, 0.07);
+    }}
+    .month-total span {{
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }}
+    .month-total strong {{
+      color: #b8f8f2;
+      font-size: 15px;
+    }}
     .table-scroll {{
       max-height: 360px;
       margin-top: 14px;
@@ -1112,7 +1149,7 @@ def render_page(
     .unmatched-panel table {{
       width: 100%;
       border-collapse: collapse;
-      min-width: 720px;
+      min-width: 520px;
       font-size: 13px;
     }}
     .unmatched-panel th,
