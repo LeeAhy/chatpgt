@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import cgi
+import base64
 import hashlib
+import hmac
 import html
 import json
 from functools import lru_cache
@@ -1600,7 +1602,24 @@ def fill_css_from_cell(cell) -> str:
 
 
 def onlyoffice_document_server_url() -> str:
-    return normalize_base_url(os.environ.get("ONLYOFFICE_DOCUMENT_SERVER_URL", "https://documentserver.onlyoffice.com"))
+    # OnlyOffice must point to a real, publicly reachable Document Server.
+    # The public ONLYOFFICE website is not an editor endpoint.
+    return normalize_base_url(os.environ.get("ONLYOFFICE_DOCUMENT_SERVER_URL", ""))
+
+
+def onlyoffice_jwt_secret() -> str:
+    return os.environ.get("ONLYOFFICE_JWT_SECRET", "").strip()
+
+
+def onlyoffice_config_token(config: dict, secret: str) -> str:
+    def encode(value: bytes) -> bytes:
+        return base64.urlsafe_b64encode(value).rstrip(b"=")
+
+    header = encode(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode("utf-8"))
+    payload = encode(json.dumps(config, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    signing_input = header + b"." + payload
+    signature = encode(hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest())
+    return b".".join((header, payload, signature)).decode("ascii")
 
 
 def onlyoffice_public_base_url(handler: Optional[BaseHTTPRequestHandler] = None) -> Optional[str]:
@@ -1690,6 +1709,9 @@ def render_onlyoffice_page(
             "compactToolbar": False,
         },
     }
+    jwt_secret = onlyoffice_jwt_secret()
+    if jwt_secret:
+        config["token"] = onlyoffice_config_token(config, jwt_secret)
     editor_config_json = json.dumps(config, ensure_ascii=False)
     docs_js_url = f"{docs_server}/web-apps/apps/api/documents/api.js"
     page = f"""<!doctype html>
