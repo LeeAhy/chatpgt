@@ -349,7 +349,7 @@ def load_metadata() -> dict:
         return {}
 
 
-def default_owner_statuses() -> dict[str, dict[str, str]]:
+def default_owner_statuses() -> dict[str, dict]:
     return {
         owner: {
             "state": "pending",
@@ -359,6 +359,7 @@ def default_owner_statuses() -> dict[str, dict[str, str]]:
             "uploaded_at": "",
             "prediction_name": "",
             "error": "",
+            "unmatched_predictions": [],
         }
         for owner in BUSINESS_OWNERS
     }
@@ -373,7 +374,18 @@ def ensure_metadata_schema(metadata: dict) -> dict:
     for owner in BUSINESS_OWNERS:
         raw = statuses.get(owner)
         if isinstance(raw, dict):
-            normalized[owner].update({key: str(value) for key, value in raw.items() if value is not None})
+            normalized[owner].update(
+                {
+                    key: str(value)
+                    for key, value in raw.items()
+                    if value is not None and key != "unmatched_predictions"
+                }
+            )
+            raw_unmatched = raw.get("unmatched_predictions")
+            if isinstance(raw_unmatched, list):
+                normalized[owner]["unmatched_predictions"] = [
+                    item for item in raw_unmatched if isinstance(item, dict)
+                ]
             if normalized[owner].get("state") not in OWNER_STATUS_LABELS:
                 normalized[owner]["state"] = "pending"
 
@@ -393,7 +405,10 @@ def update_owner_status(owner: str, **values) -> None:
         metadata = ensure_metadata_schema(load_metadata())
         status = metadata["owner_statuses"].setdefault(owner, default_owner_statuses().get(owner, {}))
         for key, value in values.items():
-            status[key] = "" if value is None else str(value)
+            if key == "unmatched_predictions":
+                status[key] = value if isinstance(value, list) else []
+            else:
+                status[key] = "" if value is None else str(value)
         metadata["owner_statuses"][owner] = status
         save_metadata(metadata)
 
@@ -544,6 +559,8 @@ def render_page(
         uploaded_at = status.get("uploaded_at") or status.get("updated_at") or ""
         done_at = status.get("updated_at") or ""
         error_text = status.get("error") or ""
+        unmatched_items = status.get("unmatched_predictions")
+        unmatched_count = len(unmatched_items) if isinstance(unmatched_items, list) else 0
         owner_status_card_items.append(
             f'<div class="owner-status {html.escape(state)}">'
             f'<strong>{html.escape(owner)}</strong>'
@@ -551,10 +568,65 @@ def render_page(
             f'<small>最近文件：{html.escape(prediction_name)}</small>'
             f'<small>上传时间：{html.escape(uploaded_at or "未上传")}</small>'
             f'<small>回填结果：{row_text}{("，" + html.escape(done_at)) if done_at else ""}</small>'
+            f'<small>未匹配：{unmatched_count} 项</small>'
             f'{f"<small>错误：{html.escape(error_text)}</small>" if error_text else ""}'
             f'</div>'
         )
     owner_status_cards = "\n".join(owner_status_card_items)
+    selected_status = owner_statuses.get(selected_owner, {})
+    selected_unmatched = selected_status.get("unmatched_predictions")
+    if not isinstance(selected_unmatched, list):
+        selected_unmatched = []
+    unmatched_row_items = []
+    for item in selected_unmatched:
+        if not isinstance(item, dict):
+            continue
+        model = html.escape(str(item.get("model") or "未命名机种"))
+        source = html.escape(str(item.get("source") or "预测文件"))
+        reason = html.escape(str(item.get("reason") or "预测机种未在共用排单中找到"))
+        month_parts = []
+        months = item.get("months")
+        if isinstance(months, dict):
+            def month_sort_key(pair):
+                try:
+                    return int(pair[0])
+                except (TypeError, ValueError):
+                    return 99
+
+            for month, qty in sorted(months.items(), key=month_sort_key):
+                try:
+                    qty_number = float(qty)
+                    qty_text = f"{qty_number:.4f}".rstrip("0").rstrip(".")
+                except (TypeError, ValueError):
+                    qty_text = str(qty)
+                month_parts.append(f"{html.escape(str(month))}月：{html.escape(qty_text)} 万pcs")
+        month_text = " ｜ ".join(month_parts) or "有预测数量"
+        unmatched_row_items.append(
+            f'<tr><td><strong>{model}</strong></td><td>{month_text}</td>'
+            f'<td>{source}</td><td>{reason}</td></tr>'
+        )
+    if unmatched_row_items:
+        unmatched_body = "".join(unmatched_row_items)
+        unmatched_panel_html = (
+            f'<section class="unmatched-panel" aria-label="未匹配预测列表">'
+            f'<div class="unmatched-head"><div><h3>未匹配预测列表</h3>'
+            f'<p>以下 {len(unmatched_row_items)} 个机种在预测中有数量，但没有稳定匹配到共用销售排单，因此没有回填。</p></div>'
+            f'<span class="unmatched-count">{len(unmatched_row_items)} 项</span></div>'
+            f'<div class="table-scroll"><table><thead><tr><th>预测机种</th><th>月份数量</th>'
+            f'<th>来源</th><th>未回填原因</th></tr></thead><tbody>{unmatched_body}</tbody></table></div></section>'
+        )
+    elif selected_status.get("state") == "done":
+        unmatched_panel_html = (
+            '<section class="unmatched-panel empty-list" aria-label="未匹配预测列表">'
+            '<div><h3>未匹配预测列表</h3><p>最近一次预测中，所有有数量的机种均已匹配。</p></div>'
+            '<span class="unmatched-count ok">0 项</span></section>'
+        )
+    else:
+        unmatched_panel_html = (
+            '<section class="unmatched-panel empty-list" aria-label="未匹配预测列表">'
+            '<div><h3>未匹配预测列表</h3><p>上传并处理预测后，这里会列出有数量但没有匹配成功的机种。</p></div>'
+            '<span class="unmatched-count">待处理</span></section>'
+        )
     job = get_job_status()
     job_state = job.get("state", "idle")
     refresh_url = owner_link(selected_owner)
@@ -990,6 +1062,81 @@ def render_page(
       line-height: 1.55;
       font-size: 13px;
     }}
+    .unmatched-panel {{
+      margin-top: 18px;
+      padding: 16px;
+      border: 1px solid rgba(245, 165, 36, 0.34);
+      border-radius: 10px;
+      background: linear-gradient(145deg, rgba(245, 165, 36, 0.08), rgba(6, 18, 30, 0.94));
+    }}
+    .unmatched-head,
+    .unmatched-panel.empty-list {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    .unmatched-panel h3 {{
+      margin: 0 0 5px;
+      font-size: 17px;
+    }}
+    .unmatched-panel p {{
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }}
+    .unmatched-count {{
+      display: inline-flex;
+      flex: 0 0 auto;
+      padding: 5px 9px;
+      border: 1px solid rgba(245, 165, 36, 0.36);
+      border-radius: 999px;
+      color: var(--warn);
+      background: rgba(245, 165, 36, 0.12);
+      font-size: 12px;
+      font-weight: 900;
+    }}
+    .unmatched-count.ok {{
+      color: var(--success);
+      border-color: rgba(53, 212, 141, 0.34);
+      background: rgba(53, 212, 141, 0.11);
+    }}
+    .table-scroll {{
+      max-height: 360px;
+      margin-top: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+    }}
+    .unmatched-panel table {{
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 720px;
+      font-size: 13px;
+    }}
+    .unmatched-panel th,
+    .unmatched-panel td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+      line-height: 1.5;
+    }}
+    .unmatched-panel th {{
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      color: #b8f8f2;
+      background: #0a1b2a;
+      font-weight: 900;
+    }}
+    .unmatched-panel tbody tr:last-child td {{
+      border-bottom: 0;
+    }}
+    .unmatched-panel tbody tr:hover {{
+      background: rgba(22, 199, 186, 0.05);
+    }}
     @media (max-width: 820px) {{
       .topline,
       .panel-head {{
@@ -1012,6 +1159,10 @@ def render_page(
       }}
       .owner-list {{
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .unmatched-head,
+      .unmatched-panel.empty-list {{
+        display: flex;
       }}
     }}
   </style>
@@ -1095,6 +1246,7 @@ def render_page(
             {preview_latest_html}
           </div>
         </form>
+        {unmatched_panel_html}
       </section>
     </section>
 
@@ -3165,6 +3317,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                         "progress": "100",
                         "updated_at": now_label(),
                         "error": "",
+                        "unmatched_predictions": summary.get("unmatched_predictions", []),
                     }
                 )
                 save_metadata(metadata)
@@ -3249,6 +3402,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             updated_at="",
             prediction_name=safe_filename(pred_field.filename, "预测文件"),
             error="",
+            unmatched_predictions=[],
         )
         set_job_status(
             state="running",

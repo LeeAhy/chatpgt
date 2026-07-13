@@ -726,12 +726,114 @@ def add_inline_month_predictions(
             predictions[code][month] += num
 
 
+def row_month_values(
+    row: list[str],
+    month_by_col: dict[int, int],
+    business_owner: Optional[str],
+) -> dict[int, float]:
+    values: dict[int, float] = defaultdict(float)
+    for col_idx, month in month_by_col.items():
+        if col_idx >= len(row):
+            continue
+        num = prediction_qty_to_wanpcs(row[col_idx], business_owner)
+        if num is not None:
+            values[month] += num
+    return dict(values)
+
+
+def unmatched_model_label(
+    row: list[str],
+    source_cols: list[int],
+    business_owner: Optional[str],
+) -> str:
+    values = [
+        clean_text(row[col_idx])
+        for col_idx in source_cols
+        if col_idx < len(row) and clean_text(row[col_idx])
+    ]
+    if not values:
+        values = prediction_match_texts(row, source_cols, business_owner)
+    for value in values:
+        if not re.search(r"(?:合计|总计|TOTAL)", value, flags=re.IGNORECASE):
+            return value
+    return ""
+
+
+def append_unmatched_prediction(
+    entries: Optional[list[dict]],
+    model: str,
+    month_values: dict[int, float],
+    source: str = "",
+    reason: str = "预测机种未在共用排单中找到",
+) -> None:
+    if entries is None or not model or not month_values:
+        return
+    nonzero_values = {
+        str(month): round(float(qty), 4)
+        for month, qty in month_values.items()
+        if abs(float(qty)) > 1e-12
+    }
+    if not nonzero_values:
+        return
+    entries.append(
+        {
+            "model": clean_text(model),
+            "months": nonzero_values,
+            "source": clean_text(source),
+            "reason": reason,
+        }
+    )
+
+
+def dedupe_unmatched_predictions(entries: Iterable[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for entry in entries:
+        model = clean_text(entry.get("model"))
+        if not model:
+            continue
+        key = normalize_code(model) or compact_text(model)
+        if not key:
+            continue
+        current = merged.setdefault(
+            key,
+            {
+                "model": model,
+                "months": {},
+                "sources": [],
+                "reason": clean_text(entry.get("reason")) or "预测机种未在共用排单中找到",
+            },
+        )
+        for month, qty in (entry.get("months") or {}).items():
+            try:
+                month_key = str(int(month))
+                quantity = round(float(qty), 4)
+            except (TypeError, ValueError):
+                continue
+            previous = current["months"].get(month_key)
+            if previous is None or abs(quantity) > abs(previous):
+                current["months"][month_key] = quantity
+        source = clean_text(entry.get("source"))
+        if source and source not in current["sources"]:
+            current["sources"].append(source)
+
+    result = []
+    for item in merged.values():
+        if not item["months"]:
+            continue
+        item["source"] = "、".join(item.pop("sources")[:5])
+        item["months"] = dict(sorted(item["months"].items(), key=lambda pair: int(pair[0])))
+        result.append(item)
+    return sorted(result, key=lambda item: normalize_code(item["model"]))
+
+
 def _build_predictions_from_rows_once(
     rows: list[list[str]],
     sales_codes: Iterable[str],
     business_owner: Optional[str],
     force_broad_match: bool = False,
     current_month: Optional[int] = None,
+    unmatched_predictions: Optional[list[dict]] = None,
+    source_name: str = "",
 ) -> dict[str, dict[int, float]]:
     predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
     code_lookup, sorted_norms = build_code_lookup(sales_codes)
@@ -740,6 +842,7 @@ def _build_predictions_from_rows_once(
 
     for row in rows:
         row_text = " ".join(clean_text(value) for value in row if clean_text(value))
+        month_values = row_month_values(row, month_by_col, business_owner)
         code = match_prediction_row_code(
             row,
             source_cols,
@@ -749,14 +852,16 @@ def _build_predictions_from_rows_once(
             force_broad_match=force_broad_match,
         )
         if not code:
+            append_unmatched_prediction(
+                unmatched_predictions,
+                unmatched_model_label(row, source_cols, business_owner),
+                month_values,
+                source=source_name,
+            )
             continue
 
-        for col_idx, month in month_by_col.items():
-            if col_idx >= len(row):
-                continue
-            num = prediction_qty_to_wanpcs(row[col_idx], business_owner)
-            if num is not None:
-                predictions[code][month] += num
+        for month, num in month_values.items():
+            predictions[code][month] += num
 
         add_inline_month_predictions(row_text, code, predictions, business_owner)
 
@@ -768,23 +873,36 @@ def build_predictions_from_rows(
     sales_codes: Iterable[str],
     business_owner: Optional[str],
     current_month: Optional[int] = None,
+    unmatched_predictions: Optional[list[dict]] = None,
+    source_name: str = "",
 ) -> dict[str, dict[int, float]]:
+    local_unmatched: list[dict] = []
     predictions = _build_predictions_from_rows_once(
         rows,
         sales_codes,
         business_owner,
         current_month=current_month,
+        unmatched_predictions=local_unmatched,
+        source_name=source_name,
     )
     if predictions:
+        if unmatched_predictions is not None:
+            unmatched_predictions.extend(local_unmatched)
         return predictions
 
-    return _build_predictions_from_rows_once(
+    broad_unmatched: list[dict] = []
+    predictions = _build_predictions_from_rows_once(
         rows,
         sales_codes,
         business_owner,
         force_broad_match=True,
         current_month=current_month,
+        unmatched_predictions=broad_unmatched,
+        source_name=source_name,
     )
+    if unmatched_predictions is not None:
+        unmatched_predictions.extend(broad_unmatched)
+    return predictions
 
 
 def build_predictions_from_workbook(
@@ -792,10 +910,11 @@ def build_predictions_from_workbook(
     sales_codes: Iterable[str],
     business_owner: Optional[str],
     current_month: Optional[int] = None,
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
     wb = load_workbook(pred_path, read_only=False, data_only=True)
     combined: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-    sheet_predictions_by_name: list[tuple[str, dict[str, dict[int, float]]]] = []
+    sheet_predictions_by_name: list[tuple[str, dict[str, dict[int, float]], list[dict]]] = []
 
     for ws in wb.worksheets:
         max_row = ws.max_row
@@ -804,28 +923,42 @@ def build_predictions_from_workbook(
         for row_idx in range(1, max_row + 1):
             rows.append([ws.cell(row_idx, col_idx).value for col_idx in range(1, max_col + 1)])
 
-        sheet_predictions = build_predictions_from_rows(rows, sales_codes, business_owner, current_month)
-        sheet_predictions_by_name.append((ws.title, sheet_predictions))
+        sheet_unmatched: list[dict] = []
+        sheet_predictions = build_predictions_from_rows(
+            rows,
+            sales_codes,
+            business_owner,
+            current_month,
+            unmatched_predictions=sheet_unmatched,
+            source_name=ws.title,
+        )
+        sheet_predictions_by_name.append((ws.title, sheet_predictions, sheet_unmatched))
 
     if business_owner == "王永仁":
         summary_predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
 
-        for sheet_name, sheet_predictions in sheet_predictions_by_name:
+        summary_unmatched: list[dict] = []
+        for sheet_name, sheet_predictions, sheet_unmatched in sheet_predictions_by_name:
             is_summary_sheet = sheet_name in {"Sheet1", "按客户汇总"}
             if not is_summary_sheet:
                 continue
+            summary_unmatched.extend(sheet_unmatched)
             for code, month_map in sheet_predictions.items():
                 for month, qty in month_map.items():
                     summary_predictions[code][month] += qty
 
         if summary_predictions:
+            if unmatched_predictions is not None:
+                unmatched_predictions.extend(summary_unmatched)
             return summary_predictions
 
         # Some legacy Wang Yongren files do not have a summary sheet. Only then
         # fall back to parsing all sheets, so detail tabs cannot override the
         # auditable summary forecast in normal weekly files.
 
-    for _, sheet_predictions in sheet_predictions_by_name:
+    for _, sheet_predictions, sheet_unmatched in sheet_predictions_by_name:
+        if unmatched_predictions is not None:
+            unmatched_predictions.extend(sheet_unmatched)
         for code, month_map in sheet_predictions.items():
             for month, qty in month_map.items():
                 combined[code][month] += qty
@@ -838,6 +971,7 @@ def build_predictions_from_text_file(
     sales_codes: Iterable[str],
     business_owner: Optional[str],
     current_month: Optional[int] = None,
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
     raw = pred_path.read_text(encoding="utf-8-sig", errors="ignore")
     sample = raw[:2048]
@@ -849,7 +983,14 @@ def build_predictions_from_text_file(
         pass
 
     rows = [row for row in csv.reader(raw.splitlines(), delimiter=delimiter)]
-    return build_predictions_from_rows(rows, sales_codes, business_owner, current_month)
+    return build_predictions_from_rows(
+        rows,
+        sales_codes,
+        business_owner,
+        current_month,
+        unmatched_predictions=unmatched_predictions,
+        source_name=pred_path.name,
+    )
 
 
 def compile_ocr_helper() -> Path:
@@ -1031,6 +1172,7 @@ def merge_month_values_max(
 def build_lidingling_samsung_fallback_predictions(
     sales_codes: Iterable[str],
     business_owner: Optional[str],
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
     code_lookup, sorted_norms = build_code_lookup(sales_codes)
     predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
@@ -1051,6 +1193,15 @@ def build_lidingling_samsung_fallback_predictions(
                 if code:
                     break
         if code is None:
+            append_unmatched_prediction(
+                unmatched_predictions,
+                machine_name,
+                {
+                    month: prediction_qty_to_wanpcs(qty_k, business_owner) or 0.0
+                    for month, qty_k in month_values_k.items()
+                },
+                source="图片识别",
+            )
             continue
 
         month_values = {
@@ -1066,17 +1217,26 @@ def build_predictions_from_lidingling_image(
     pred_path: Path,
     sales_codes: Iterable[str],
     business_owner: Optional[str],
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
     try:
         tokens = run_ocr(pred_path)
     except Exception:
-        predictions = build_lidingling_samsung_fallback_predictions(sales_codes, business_owner)
+        predictions = build_lidingling_samsung_fallback_predictions(
+            sales_codes,
+            business_owner,
+            unmatched_predictions=unmatched_predictions,
+        )
         if predictions:
             return predictions
         raise
 
     if not tokens:
-        predictions = build_lidingling_samsung_fallback_predictions(sales_codes, business_owner)
+        predictions = build_lidingling_samsung_fallback_predictions(
+            sales_codes,
+            business_owner,
+            unmatched_predictions=unmatched_predictions,
+        )
         if predictions:
             return predictions
         raise ValueError("图片里没有识别到文字，请换一张更清晰的截图或上传表格文件。")
@@ -1126,6 +1286,12 @@ def build_predictions_from_lidingling_image(
 
         if code is None:
             unmatched_rows.append(text)
+            append_unmatched_prediction(
+                unmatched_predictions,
+                machine_candidates[0] if machine_candidates else text,
+                assign_month_values_from_row(row, month_headers, business_owner),
+                source="图片识别",
+            )
             debug_lines.append(" unmatched")
             continue
 
@@ -1145,7 +1311,11 @@ def build_predictions_from_lidingling_image(
     if predictions:
         return predictions
 
-    fallback_predictions = build_lidingling_samsung_fallback_predictions(sales_codes, business_owner)
+    fallback_predictions = build_lidingling_samsung_fallback_predictions(
+        sales_codes,
+        business_owner,
+        unmatched_predictions=unmatched_predictions,
+    )
     if fallback_predictions:
         return fallback_predictions
 
@@ -1159,9 +1329,15 @@ def build_predictions_from_image(
     pred_path: Path,
     sales_codes: Iterable[str],
     business_owner: Optional[str],
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
     if business_owner == "李玎玲":
-        return build_predictions_from_lidingling_image(pred_path, sales_codes, business_owner)
+        return build_predictions_from_lidingling_image(
+            pred_path,
+            sales_codes,
+            business_owner,
+            unmatched_predictions=unmatched_predictions,
+        )
 
     tokens = run_ocr(pred_path)
     if not tokens:
@@ -1188,6 +1364,17 @@ def build_predictions_from_image(
         row_text = " ".join(token.text for token in row)
         code = match_code(row_text, code_lookup, sorted_norms)
         if not code:
+            code = match_owner_fuzzy_code(row_text, business_owner, code_lookup, sorted_norms)
+        if not code:
+            month_headers = {month: x for x, month in header_months_by_x}
+            month_values = assign_month_values_from_row(row, month_headers, business_owner)
+            machine_candidates = candidate_machine_texts(row, month_headers)
+            append_unmatched_prediction(
+                unmatched_predictions,
+                machine_candidates[0] if machine_candidates else "",
+                month_values,
+                source="图片识别",
+            )
             continue
 
         numbers: list[tuple[float, float]] = []
@@ -1223,16 +1410,34 @@ def build_predictions(
     sales_codes: Iterable[str],
     business_owner: Optional[str] = None,
     as_of_date: Optional[date] = None,
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
     pred_path = Path(pred_path)
     suffix = pred_path.suffix.lower()
     current_month = (as_of_date or date.today()).month
     if suffix in EXCEL_SUFFIXES:
-        return build_predictions_from_workbook(pred_path, sales_codes, business_owner, current_month)
+        return build_predictions_from_workbook(
+            pred_path,
+            sales_codes,
+            business_owner,
+            current_month,
+            unmatched_predictions=unmatched_predictions,
+        )
     if suffix in TEXT_SUFFIXES:
-        return build_predictions_from_text_file(pred_path, sales_codes, business_owner, current_month)
+        return build_predictions_from_text_file(
+            pred_path,
+            sales_codes,
+            business_owner,
+            current_month,
+            unmatched_predictions=unmatched_predictions,
+        )
     if suffix in IMAGE_SUFFIXES:
-        return build_predictions_from_image(pred_path, sales_codes, business_owner)
+        return build_predictions_from_image(
+            pred_path,
+            sales_codes,
+            business_owner,
+            unmatched_predictions=unmatched_predictions,
+        )
     raise ValueError("预测信息请上传 .xlsx、.jpg 或 .png 文件。")
 
 
@@ -1370,6 +1575,7 @@ def unchanged_summary(
     business_owner: Optional[str],
     as_of_date: date,
     warning: str,
+    unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict:
     save_sales_workbook(sales_wb, output_path, freeze_formulas)
     return {
@@ -1383,6 +1589,7 @@ def unchanged_summary(
         "business_owner": business_owner,
         "as_of_date": as_of_date,
         "warnings": [warning],
+        "unmatched_predictions": dedupe_unmatched_predictions(unmatched_predictions or []),
     }
 
 
@@ -1520,11 +1727,13 @@ def process_sales_workbooks(
         )
 
     report_progress(22, "读取业务预测文件")
+    unmatched_predictions: list[dict] = []
     predictions = build_predictions(
         pred_path,
         sales_codes,
         business_owner=business_owner,
         as_of_date=as_of_date,
+        unmatched_predictions=unmatched_predictions,
     )
     report_progress(32, "匹配预测机种与销售排单客户机种")
     if not predictions:
@@ -1540,6 +1749,7 @@ def process_sales_workbooks(
             business_owner,
             as_of_date,
             "预测信息里没有识别到可用的机种和数量，已生成未改动文件。",
+            unmatched_predictions=unmatched_predictions,
         )
 
     fill_targets = [
@@ -1638,6 +1848,13 @@ def process_sales_workbooks(
                     row = code_to_row.get(matched_code)
             if row is None:
                 missing_rows.append((target.sheet, target.label, code, business_owner or "全部"))
+                append_unmatched_prediction(
+                    unmatched_predictions,
+                    code,
+                    {target.month: qty},
+                    source=f"{target.sheet} / {target.label}",
+                    reason="该月份预估栏中没有找到对应客户机种",
+                )
                 continue
 
             qty_cell = ws.cell(row, target.qty_col)
@@ -1715,6 +1932,7 @@ def process_sales_workbooks(
         "as_of_date": as_of_date,
         "completed_deductions": completed_deductions,
         "warnings": warnings,
+        "unmatched_predictions": dedupe_unmatched_predictions(unmatched_predictions),
     }
 
     print(f"saved: {output_path}")
@@ -1742,6 +1960,7 @@ def process_sales_workbooks(
     print(f"completed deductions: {len(completed_deductions)}")
     for item in completed_deductions[:20]:
         print("completed_deduction", item)
+    print(f"unmatched predictions with quantities: {len(summary['unmatched_predictions'])}")
 
     return summary
 
