@@ -21,6 +21,7 @@ from runtime_bootstrap import ensure_bundled_python_path
 ensure_bundled_python_path()
 
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 from openpyxl.utils import get_column_letter
 
 from freeze_formulas import freeze_workbook_inplace
@@ -46,6 +47,7 @@ COMPLETED_LABEL_WORDS = ("已完成", "完成")
 MAX_FORMULA_RATIO = 0.2
 MIN_REASONABLE_PRICE = 0.01
 MAX_REASONABLE_PRICE = 1000.0
+MATCHED_FORECAST_FILL = PatternFill(fill_type="solid", fgColor="DDEBF7")
 OCR_SOURCE_PATH = Path(__file__).with_name("ocr_image.m")
 OCR_BINARY_PATH = Path(tempfile.gettempdir()) / "sales_ocr_image"
 
@@ -422,6 +424,31 @@ def select_latest_fill_targets(targets: Iterable[FillTarget]) -> list[FillTarget
         if current is None or target.qty_col > current.qty_col:
             latest_by_sheet_month[key] = target
     return list(latest_by_sheet_month.values())
+
+
+def select_relevant_fill_targets(
+    targets: Iterable[FillTarget],
+    current_month: int,
+) -> list[FillTarget]:
+    """Prefer the current multi-month planning sheet over archived month sheets."""
+    latest = [
+        target
+        for target in select_latest_fill_targets(targets)
+        if target.month >= current_month
+    ]
+    months_by_sheet: dict[str, set[int]] = defaultdict(set)
+    for target in latest:
+        months_by_sheet[target.sheet].add(target.month)
+    if not months_by_sheet:
+        return []
+
+    best_sheet, best_months = max(
+        months_by_sheet.items(),
+        key=lambda item: (len(item[1]), max(item[1]), item[0]),
+    )
+    if len(best_months) <= 1:
+        return latest
+    return [target for target in latest if target.sheet == best_sheet]
 
 
 def is_zero_placeholder(value) -> bool:
@@ -1591,6 +1618,9 @@ def unchanged_summary(
         "as_of_date": as_of_date,
         "warnings": [warning],
         "unmatched_predictions": dedupe_unmatched_predictions(unmatched_predictions or []),
+        "fill_target_months": [],
+        "matched_model_count": 0,
+        "matched_customer_models": [],
     }
 
 
@@ -1669,6 +1699,31 @@ def cell_has_existing_nonzero_value(value) -> bool:
     if isinstance(value, str) and value.startswith("="):
         return False
     return not is_zero_placeholder(value)
+
+
+def cell_is_blank(value) -> bool:
+    """Only genuinely empty cells are writable in the shared schedule."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def filter_unmatched_prediction_months(
+    entries: Iterable[dict],
+    allowed_months: Iterable[int],
+) -> list[dict]:
+    allowed = {int(month) for month in allowed_months}
+    filtered: list[dict] = []
+    for item in dedupe_unmatched_predictions(entries):
+        months = item.get("months")
+        if not isinstance(months, dict):
+            continue
+        kept = {
+            str(month): qty
+            for month, qty in months.items()
+            if str(month).isdigit() and int(month) in allowed and parse_number(qty) not in (None, 0)
+        }
+        if kept:
+            filtered.append({**item, "months": kept})
+    return filtered
 
 
 def process_sales_workbooks(
@@ -1753,11 +1808,10 @@ def process_sales_workbooks(
             unmatched_predictions=unmatched_predictions,
         )
 
-    fill_targets = [
-        target
-        for target in select_latest_fill_targets(find_fill_targets(sales_values_wb))
-        if target.month >= as_of_date.month
-    ]
+    fill_targets = select_relevant_fill_targets(
+        find_fill_targets(sales_values_wb),
+        as_of_date.month,
+    )
     report_progress(40, f"识别销售排单预估空白栏：{len(fill_targets)} 个")
     previous_estimate_values = build_previous_estimate_cache(sales_values_wb, fill_targets)
     sales_values_wb.close()
@@ -1784,6 +1838,7 @@ def process_sales_workbooks(
     completed_deductions = []
     skipped_existing_values = []
     zero_filled_rows = []
+    matched_customer_models: set[str] = set()
     warnings = []
 
     total_targets = max(len(fill_targets), 1)
@@ -1805,6 +1860,7 @@ def process_sales_workbooks(
         code_to_row = {}
         normalized_code_to_code = {}
         row_meta = {}
+        eligible_rows: set[int] = set()
         for row in iter_sales_data_rows(ws):
             owner = clean_text(vws.cell(row, target.owner_col).value)
             if business_owner and not owner_matches(business_owner, owner):
@@ -1819,6 +1875,8 @@ def process_sales_workbooks(
 
             if not row_codes:
                 continue
+
+            eligible_rows.add(row)
 
             meta = {
                 "O": vws[f"O{row}"].value,
@@ -1835,6 +1893,7 @@ def process_sales_workbooks(
                 if norm_code:
                     normalized_code_to_code[norm_code] = code
 
+        matched_prediction_rows: set[int] = set()
         for code, month_map in predictions.items():
             qty = month_map.get(target.month)
             if qty is None:
@@ -1851,11 +1910,13 @@ def process_sales_workbooks(
                 missing_rows.append((target.sheet, target.label, code, business_owner or "全部"))
                 continue
 
+            matched_prediction_rows.add(row)
+
             qty_cell = ws.cell(row, target.qty_col)
             amt_cell = ws.cell(row, target.amt_col)
 
-            qty_has_existing_value = cell_has_existing_nonzero_value(qty_cell.value)
-            amt_has_existing_value = cell_has_existing_nonzero_value(amt_cell.value)
+            qty_has_existing_value = not cell_is_blank(qty_cell.value)
+            amt_has_existing_value = not cell_is_blank(amt_cell.value)
             if qty_has_existing_value or amt_has_existing_value:
                 skipped_existing_values.append(
                     (
@@ -1878,6 +1939,7 @@ def process_sales_workbooks(
 
             qty_cell.value = qty
             qty_cell.number_format = "0.0000"
+            qty_cell.fill = MATCHED_FORECAST_FILL
 
             previous_qty, previous_amount = previous_estimate_values.get(
                 (target.sheet, target.qty_col, row),
@@ -1886,6 +1948,8 @@ def process_sales_workbooks(
             amount = amount_from_previous_week(qty, previous_qty, previous_amount)
             amt_cell.value = amount
             amt_cell.number_format = "0.00"
+            amt_cell.fill = MATCHED_FORECAST_FILL
+            matched_customer_models.add(clean_text(vws.cell(row, target.code_col).value) or matched_code)
             updates.append(
                 (
                     target.sheet,
@@ -1900,8 +1964,30 @@ def process_sales_workbooks(
                 )
             )
 
-    if not updates:
+        # Rows belonging to this owner but without a prediction for this target
+        # month receive 0/0 only when both forecast cells are still blank.
+        for row in sorted(eligible_rows - matched_prediction_rows):
+            qty_cell = ws.cell(row, target.qty_col)
+            amt_cell = ws.cell(row, target.amt_col)
+            if not cell_is_blank(qty_cell.value) or not cell_is_blank(amt_cell.value):
+                continue
+            qty_cell.value = 0
+            qty_cell.number_format = "0.0000"
+            amt_cell.value = 0
+            amt_cell.number_format = "0.00"
+            zero_filled_rows.append(
+                (
+                    target.sheet,
+                    row,
+                    clean_text(vws.cell(row, target.code_col).value),
+                    target.label,
+                )
+            )
+
+    if not updates and not zero_filled_rows:
         warnings.append("没有找到可回填的匹配行，已生成未改动文件。")
+    elif not updates:
+        warnings.append("没有匹配到有预测数量的机种；预估空白格已按规则写入 0。")
 
     calc = getattr(sales_wb, "calculation", None)
     if calc is not None:
@@ -1913,6 +1999,7 @@ def process_sales_workbooks(
     save_sales_workbook(sales_wb, output_path, freeze_formulas)
     report_progress(96, "整理回填结果")
 
+    fill_target_months = sorted({target.month for target in fill_targets})
     summary = {
         "output_path": output_path,
         "updated_rows": len(updates),
@@ -1926,7 +2013,13 @@ def process_sales_workbooks(
         "as_of_date": as_of_date,
         "completed_deductions": completed_deductions,
         "warnings": warnings,
-        "unmatched_predictions": dedupe_unmatched_predictions(unmatched_predictions),
+        "unmatched_predictions": filter_unmatched_prediction_months(
+            unmatched_predictions,
+            fill_target_months,
+        ),
+        "fill_target_months": fill_target_months,
+        "matched_model_count": len(matched_customer_models),
+        "matched_customer_models": sorted(matched_customer_models, key=normalize_code),
     }
 
     print(f"saved: {output_path}")

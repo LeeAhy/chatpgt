@@ -14,11 +14,13 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 from datetime import datetime
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
@@ -58,6 +60,11 @@ REMOTE_MASTER_KEY = "current_sales.xlsx"
 REMOTE_LATEST_KEY = "latest_generated.xlsx"
 REMOTE_METADATA_KEY = "metadata.json"
 REMOTE_CHUNK_SIZE = 2 * 1024 * 1024
+LOGIN_USERNAME = os.environ.get("SALES_LOGIN_USERNAME", "admin").strip()
+LOGIN_PASSWORD = os.environ.get("SALES_LOGIN_PASSWORD", "")
+LOGIN_SECRET = os.environ.get("SALES_LOGIN_SECRET", "").strip() or REMOTE_STORAGE_SECRET
+LOGIN_COOKIE_NAME = "sales_upload_session"
+LOGIN_SESSION_SECONDS = 12 * 60 * 60
 STATE_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
 JOB_STATUS = {
@@ -173,6 +180,108 @@ def safe_owner(value: Optional[str]) -> str:
 
 def owner_link(owner: str) -> str:
     return f"/owner/{urllib.parse.quote(owner)}"
+
+
+def login_is_configured() -> bool:
+    return bool(LOGIN_USERNAME and LOGIN_PASSWORD and LOGIN_SECRET)
+
+
+def session_signature(timestamp: str) -> str:
+    message = f"{LOGIN_USERNAME}|{timestamp}".encode("utf-8")
+    return hmac.new(LOGIN_SECRET.encode("utf-8"), message, hashlib.sha256).hexdigest()
+
+
+def authenticated(handler: BaseHTTPRequestHandler) -> bool:
+    if not login_is_configured():
+        return False
+    cookie = SimpleCookie()
+    try:
+        cookie.load(handler.headers.get("Cookie", ""))
+        morsel = cookie.get(LOGIN_COOKIE_NAME)
+        if morsel is None:
+            return False
+        timestamp, signature = morsel.value.split(".", 1)
+        issued_at = int(timestamp)
+    except (ValueError, TypeError):
+        return False
+    if issued_at > int(time.time()) + 60 or int(time.time()) - issued_at > LOGIN_SESSION_SECONDS:
+        return False
+    return hmac.compare_digest(signature, session_signature(timestamp))
+
+
+def render_login_page(error: str = "") -> str:
+    if not login_is_configured():
+        message = (
+            "网站登录尚未完成安全配置。请在 Render 的 Environment 中设置 "
+            "SALES_LOGIN_PASSWORD 和 SALES_LOGIN_SECRET，保存后重新部署。"
+        )
+        form_html = ""
+    else:
+        message = error
+        form_html = """
+        <form method="post" action="/login">
+          <label for="username">账号</label>
+          <input id="username" name="username" autocomplete="username" required autofocus>
+          <label for="password">密码</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required>
+          <button type="submit">登录工作台</button>
+        </form>
+        """
+    notice = f'<div class="notice">{html.escape(message)}</div>' if message else ""
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>登录销售排单工作台</title><style>
+:root{{color-scheme:dark}}*{{box-sizing:border-box}}body{{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;color:#edf8f7;font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:radial-gradient(circle at 75% 10%,rgba(22,199,186,.16),transparent 30rem),#020914}}
+.login{{width:min(440px,100%);padding:30px;border:1px solid #20384a;border-radius:16px;background:linear-gradient(145deg,#0a1b2a,#06111d);box-shadow:0 24px 70px rgba(0,0,0,.5)}}
+h1{{margin:0 0 8px;font-size:26px}}p{{margin:0 0 22px;color:#91a6b4;line-height:1.7}}form{{display:grid;gap:10px}}label{{font-weight:800;margin-top:6px}}input{{width:100%;min-height:46px;padding:10px 12px;border:1px solid #2b4d62;border-radius:9px;color:#edf8f7;background:#020d18;font:inherit}}button{{min-height:46px;margin-top:10px;border:0;border-radius:9px;background:linear-gradient(135deg,#35ded0,#12b8ac);color:#001713;font:inherit;font-weight:900;cursor:pointer}}.notice{{margin-bottom:16px;padding:12px;border:1px solid rgba(255,116,108,.4);border-radius:9px;background:rgba(255,116,108,.1);color:#ff918a;line-height:1.6}}
+</style></head><body><main class="login"><h1>销售排单回填工作台</h1><p>此网站包含内部销售数据，请先登录后使用。</p>{notice}{form_html}</main></body></html>"""
+
+
+def redirect(handler: BaseHTTPRequestHandler, location: str, cookie: str = "") -> None:
+    handler.send_response(303)
+    handler.send_header("Location", location)
+    handler.send_header("Cache-Control", "no-store")
+    if cookie:
+        handler.send_header("Set-Cookie", cookie)
+    handler.end_headers()
+
+
+def make_session_cookie(handler: BaseHTTPRequestHandler, clear: bool = False) -> str:
+    secure = handler.headers.get("X-Forwarded-Proto", "").split(",")[0].strip().lower() == "https"
+    if clear:
+        value = ""
+        max_age = 0
+    else:
+        timestamp = str(int(time.time()))
+        value = f"{timestamp}.{session_signature(timestamp)}"
+        max_age = LOGIN_SESSION_SECONDS
+    parts = [
+        f"{LOGIN_COOKIE_NAME}={value}",
+        "Path=/",
+        f"Max-Age={max_age}",
+        "HttpOnly",
+        "SameSite=Strict",
+    ]
+    if secure:
+        parts.append("Secure")
+    return "; ".join(parts)
+
+
+def handle_login(handler: BaseHTTPRequestHandler) -> None:
+    if not login_is_configured():
+        write_html(handler, 503, render_login_page())
+        return
+    try:
+        length = min(int(handler.headers.get("Content-Length", "0") or 0), 65536)
+    except ValueError:
+        length = 0
+    values = urllib.parse.parse_qs(handler.rfile.read(length).decode("utf-8", errors="replace"))
+    username = (values.get("username") or [""])[0]
+    password = (values.get("password") or [""])[0]
+    if hmac.compare_digest(username, LOGIN_USERNAME) and hmac.compare_digest(password, LOGIN_PASSWORD):
+        redirect(handler, "/", make_session_cookie(handler))
+        return
+    write_html(handler, 401, render_login_page("账号或密码不正确，请重新输入。"))
 
 
 def resolve_sheet_name(requested: str, sheet_names: list[str]) -> str:
@@ -360,6 +469,8 @@ def default_owner_statuses() -> dict[str, dict]:
             "prediction_name": "",
             "error": "",
             "unmatched_predictions": [],
+            "fill_target_months": [],
+            "matched_model_count": "",
         }
         for owner in BUSINESS_OWNERS
     }
@@ -378,13 +489,20 @@ def ensure_metadata_schema(metadata: dict) -> dict:
                 {
                     key: str(value)
                     for key, value in raw.items()
-                    if value is not None and key != "unmatched_predictions"
+                    if value is not None and key not in {"unmatched_predictions", "fill_target_months"}
                 }
             )
             raw_unmatched = raw.get("unmatched_predictions")
             if isinstance(raw_unmatched, list):
                 normalized[owner]["unmatched_predictions"] = [
                     item for item in raw_unmatched if isinstance(item, dict)
+                ]
+            raw_months = raw.get("fill_target_months")
+            if isinstance(raw_months, list):
+                normalized[owner]["fill_target_months"] = [
+                    int(month)
+                    for month in raw_months
+                    if str(month).isdigit() and 1 <= int(month) <= 12
                 ]
             if normalized[owner].get("state") not in OWNER_STATUS_LABELS:
                 normalized[owner]["state"] = "pending"
@@ -405,7 +523,7 @@ def update_owner_status(owner: str, **values) -> None:
         metadata = ensure_metadata_schema(load_metadata())
         status = metadata["owner_statuses"].setdefault(owner, default_owner_statuses().get(owner, {}))
         for key, value in values.items():
-            if key == "unmatched_predictions":
+            if key in {"unmatched_predictions", "fill_target_months"}:
                 status[key] = value if isinstance(value, list) else []
             else:
                 status[key] = "" if value is None else str(value)
@@ -524,6 +642,7 @@ def render_page(
     latest_owner = metadata.get("last_owner", "")
     latest_time = metadata.get("last_generated_at", "")
     latest_rows = metadata.get("last_updated_rows", "")
+    latest_models = metadata.get("last_matched_model_count", "")
     latest_file = metadata.get("latest_name", metadata.get("master_name", "最新销售排单.xlsx"))
     master_status = "已启用" if has_master else "待上传"
     master_status_class = "ready" if has_master else "empty"
@@ -540,7 +659,8 @@ def render_page(
     if master_time:
         detail_parts.append(f"初始化/替换时间：{master_time}")
     if latest_owner:
-        detail_parts.append(f"最近回填：{latest_owner}，更新 {latest_rows} 行，{latest_time}")
+        result_text = f"已回填 {latest_models} 个客户机种" if str(latest_models) else f"更新 {latest_rows} 行"
+        detail_parts.append(f"最近回填：{latest_owner}，{result_text}，{latest_time}")
     if latest_file and has_master:
         detail_parts.append(f"下载文件名：{latest_file}")
     detail_parts.append(storage_description())
@@ -554,7 +674,12 @@ def render_page(
         if state == "running" and progress_text:
             row_text = f"处理中 {html.escape(progress_text)}%"
         else:
-            row_text = f'{html.escape(status.get("updated_rows", ""))} 行' if status.get("updated_rows") else "等待预测"
+            matched_count = status.get("matched_model_count", "")
+            row_text = (
+                f'已回填 {html.escape(str(matched_count))} 个客户机种'
+                if state == "done" and str(matched_count) != ""
+                else "等待预测"
+            )
         prediction_name = status.get("prediction_name") or "暂无上传记录"
         uploaded_at = status.get("uploaded_at") or status.get("updated_at") or ""
         done_at = status.get("updated_at") or ""
@@ -577,8 +702,15 @@ def render_page(
     selected_unmatched = selected_status.get("unmatched_predictions")
     if not isinstance(selected_unmatched, list):
         selected_unmatched = []
+    selected_target_months = selected_status.get("fill_target_months")
+    if not isinstance(selected_target_months, list):
+        selected_target_months = []
+    selected_target_months = sorted(
+        {int(month) for month in selected_target_months if str(month).isdigit() and 1 <= int(month) <= 12}
+    )
+    target_month_set = set(selected_target_months)
     unmatched_row_items = []
-    unmatched_month_totals: dict[int, float] = {}
+    unmatched_month_totals: dict[int, float] = {month: 0.0 for month in selected_target_months}
     for item in selected_unmatched:
         if not isinstance(item, dict):
             continue
@@ -593,6 +725,8 @@ def render_page(
                     return 99
 
             for month, qty in sorted(months.items(), key=month_sort_key):
+                if target_month_set and (not str(month).isdigit() or int(month) not in target_month_set):
+                    continue
                 try:
                     qty_number = float(qty)
                     qty_text = f"{qty_number:.4f}".rstrip("0").rstrip(".")
@@ -607,7 +741,9 @@ def render_page(
                 except (TypeError, ValueError):
                     pass
                 month_parts.append(f"{html.escape(str(month))}月：{html.escape(qty_text)} 万pcs")
-        month_text = " ｜ ".join(month_parts) or "有预测数量"
+        if not month_parts:
+            continue
+        month_text = " ｜ ".join(month_parts)
         unmatched_row_items.append(
             f'<tr><td><strong>{model}</strong></td><td>{month_text}</td></tr>'
         )
@@ -658,9 +794,15 @@ def render_page(
         )
         refresh_meta = f'<meta http-equiv="refresh" content="5; url={html.escape(refresh_url)}">'
     elif job_state == "done":
+        completed_count = job.get("matched_model_count", "")
+        completed_text = (
+            f'已回填 {html.escape(str(completed_count))} 个客户机种'
+            if str(completed_count) != ""
+            else f'更新 {html.escape(str(job.get("updated_rows", "")))} 行'
+        )
         job_html = (
             f'<div class="notice success" role="status">最近处理完成：{html.escape(job.get("owner", ""))}，'
-            f'更新 {html.escape(str(job.get("updated_rows", "")))} 行，'
+            f'{completed_text}，'
             f'{html.escape(job.get("finished_at", ""))}。可以下载当前最新版。</div>'
         )
         refresh_meta = ""
@@ -1209,9 +1351,9 @@ def render_page(
     <section class="topline">
       <div>
         <h1>销售排单回填工作台</h1>
-        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；系统只补充当前空白的“预估”数量/金额栏，未匹配机种保持空白，其他原始数据不修改。</p>
+        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；系统只写入当前空白的“预估”数量/金额栏，有预测依据的回填格标为浅蓝色，无匹配数据的机种写入 0，其他原始数据不修改。</p>
       </div>
-      <div class="access">{html.escape(access_note)}</div>
+      <div class="access">{html.escape(access_note)}<br><a href="/logout">安全退出</a></div>
     </section>
 
     <section class="master-panel" aria-label="共用销售排单">
@@ -1254,7 +1396,7 @@ def render_page(
             <h2>{html.escape(selected_owner)} 的预测上传</h2>
             <p class="subtext">{html.escape(upload_hint)} 预测会写入上方共用销售排单，销售排单必须保留“业务担当”和“客户机种”。</p>
           </div>
-          <div class="badge">无需登录</div>
+          <div class="badge ready">登录保护已启用</div>
         </div>
         {message_html}
         {error_html}
@@ -1262,7 +1404,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>系统会以销售排单上的预估栏为准：例如本周是 6/29预估（7月/8月/9月/10月），下周变成 7/6预估时也会自动识别；当月会扣减同一客户机种已完成数量，每次回填都会保存为共用排单最新版。</span>
+            <span>系统以销售排单实际存在的预估空白栏月份为准；当月会扣减同一客户机种已完成数量。只有数量和金额都为空的预估格才会写入，已有值和其他原始数据绝不覆盖。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -1294,7 +1436,7 @@ def render_page(
       </div>
       <div class="summary-item">
         <strong>担当隔离</strong>
-        <span>每次只回填所选业务担当的销售排单行，便于多人分开上传。</span>
+        <span>每次只处理所选业务担当的销售排单行；无预测数据的预估空白格写入 0。</span>
       </div>
       <div class="summary-item">
         <strong>扣已完成</strong>
@@ -3344,6 +3486,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                         "last_owner": selected_owner,
                         "last_generated_at": now_label(),
                         "last_updated_rows": summary["updated_rows"],
+                        "last_matched_model_count": summary.get("matched_model_count", 0),
                     }
                 )
                 metadata = ensure_metadata_schema(metadata)
@@ -3355,6 +3498,8 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                         "updated_at": now_label(),
                         "error": "",
                         "unmatched_predictions": summary.get("unmatched_predictions", []),
+                        "fill_target_months": summary.get("fill_target_months", []),
+                        "matched_model_count": str(summary.get("matched_model_count", 0)),
                     }
                 )
                 save_metadata(metadata)
@@ -3365,6 +3510,7 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
             message="处理完成",
             finished_at=now_label(),
             updated_rows=summary["updated_rows"],
+            matched_model_count=summary.get("matched_model_count", 0),
             error="",
             progress="100",
             step="处理完成",
@@ -3440,6 +3586,8 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             prediction_name=safe_filename(pred_field.filename, "预测文件"),
             error="",
             unmatched_predictions=[],
+            fill_target_months=[],
+            matched_model_count="",
         )
         set_job_status(
             state="running",
@@ -3491,6 +3639,21 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if path == "/healthz":
+            write_text(self, 200, "ok")
+            return
+        if path == "/login":
+            if authenticated(self):
+                redirect(self, "/")
+            else:
+                write_html(self, 200 if login_is_configured() else 503, render_login_page())
+            return
+        if path == "/logout":
+            redirect(self, "/login", make_session_cookie(self, clear=True))
+            return
+        if not authenticated(self):
+            redirect(self, "/login")
+            return
         if path in ("/", "/index.html") or path.startswith("/owner/"):
             owner = selected_owner_from_path(path, query)
             write_html(self, 200, render_page(handler=self, selected_owner=owner).decode("utf-8"))
@@ -3529,10 +3692,6 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
 
         if path == "/api/onlyoffice/callback":
             write_text(self, 404, "Preview and editing are temporarily disabled")
-            return
-
-        if path == "/healthz":
-            write_text(self, 200, "ok")
             return
 
         if path == "/status":
@@ -3574,13 +3733,18 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if path == "/healthz":
+            write_text(self, 200, "ok", head=True)
+            return
+        if path == "/login":
+            write_html(self, 200 if login_is_configured() else 503, render_login_page(), head=True)
+            return
+        if not authenticated(self):
+            redirect(self, "/login")
+            return
         if path in ("/", "/index.html") or path.startswith("/owner/"):
             owner = selected_owner_from_path(path, query)
             write_html(self, 200, render_page(handler=self, selected_owner=owner).decode("utf-8"), head=True)
-            return
-
-        if path == "/healthz":
-            write_text(self, 200, "ok", head=True)
             return
 
         if path == "/preview":
@@ -3616,6 +3780,12 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/login":
+            handle_login(self)
+            return
+        if not authenticated(self):
+            redirect(self, "/login")
+            return
         if parsed.path == "/api/editor/save":
             write_text(self, 404, "Preview and editing are temporarily disabled")
             return
@@ -3641,7 +3811,9 @@ def main() -> None:
     server = ThreadingHTTPServer((HOST, PORT), SalesUploadHandler)
     public_url = get_public_share_url()
     print(f"销售排单网站已启动：http://0.0.0.0:{PORT}")
-    print("现在不需要登录，按业务担当页面上传预测信息。")
+    print("网站已启用登录保护；登录后可按业务担当页面上传预测信息。")
+    if not login_is_configured():
+        print("尚未配置 SALES_LOGIN_PASSWORD / SALES_LOGIN_SECRET，数据页面将保持锁定。")
     if public_url:
         print(f"公开访问：{public_url}/")
     else:

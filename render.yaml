@@ -5,3 +5,10 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python3 web_app.py
+    envVars:
+      - key: SALES_LOGIN_USERNAME
+        value: admin
+      - key: SALES_LOGIN_PASSWORD
+        sync: false
+      - key: SALES_LOGIN_SECRET
+        generateValue: true
