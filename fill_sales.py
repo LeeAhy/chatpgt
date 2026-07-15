@@ -1654,7 +1654,7 @@ def written_pair_coordinates(written_pairs: Iterable[str]) -> dict[str, set[str]
 
 def cell_xml_pattern(coordinate: str) -> re.Pattern[str]:
     return re.compile(
-        rf'<c\b(?=[^>]*\br="{re.escape(coordinate)}")[^>]*(?:/>|>.*?</c>)',
+        rf'<c\b(?=[^>]*\br="{re.escape(coordinate)}"(?:\s|/?>))[^>]*?(?:/>|>.*?</c>)',
         re.DOTALL,
     )
 
@@ -1678,8 +1678,9 @@ def patch_sheet_xml_cells(
 ) -> bytes:
     source_text = source_xml.decode("utf-8")
     generated_text = generated_xml.decode("utf-8")
+    target_coordinates = set(coordinates)
     for coordinate in sorted(
-        set(coordinates),
+        target_coordinates,
         key=lambda value: (int(re.search(r"[0-9]+", value).group(0)), column_index_from_string(re.match(r"[A-Z]+", value).group(0))),
     ):
         pattern = cell_xml_pattern(coordinate)
@@ -1708,7 +1709,25 @@ def patch_sheet_xml_cells(
         )
         replacement = row_match.group(1) + patched_body + row_match.group(3)
         source_text = source_text[: row_match.start()] + replacement + source_text[row_match.end() :]
-    return source_text.encode("utf-8")
+
+    patched_xml = source_text.encode("utf-8")
+    source_cells = {
+        cell.attrib.get("r", ""): ET.tostring(cell, encoding="unicode")
+        for cell in ET.fromstring(source_xml).iter(
+            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"
+        )
+        if cell.attrib.get("r", "") not in target_coordinates
+    }
+    patched_cells = {
+        cell.attrib.get("r", ""): ET.tostring(cell, encoding="unicode")
+        for cell in ET.fromstring(patched_xml).iter(
+            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"
+        )
+        if cell.attrib.get("r", "") not in target_coordinates
+    }
+    if source_cells != patched_cells:
+        raise ValueError("检测到非预估单元格发生变化，为保护原始数据和公式已停止保存。")
+    return patched_xml
 
 
 def preserve_source_workbook_with_forecast_cells(
@@ -1881,7 +1900,7 @@ def amount_from_previous_week(
     previous_amount: Optional[float],
 ) -> tuple[float, bool]:
     if previous_qty == 0:
-        return 0.0, True
+        return 0.0, abs(float(qty)) > 1e-12
     if previous_qty is None or previous_amount is None:
         return 0.0, False
     return round(qty * previous_amount / previous_qty, 4), False
