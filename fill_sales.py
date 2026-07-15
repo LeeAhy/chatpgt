@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import csv
 import gc
+import hashlib
+import json
 import math
 import os
 import posixpath
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import zipfile
 import xml.etree.ElementTree as ET
@@ -471,9 +474,16 @@ def is_zero_placeholder(value) -> bool:
     return num == 0
 
 
-def collect_sales_codes(sales_values_wb, business_owner: Optional[str] = None) -> set[str]:
+def collect_sales_codes(
+    sales_values_wb,
+    business_owner: Optional[str] = None,
+    sheet_names: Optional[Iterable[str]] = None,
+) -> set[str]:
     codes: set[str] = set()
+    allowed_sheets = {clean_text(name) for name in (sheet_names or []) if clean_text(name)}
     for sheet_name in sales_values_wb.sheetnames:
+        if allowed_sheets and sheet_name not in allowed_sheets:
+            continue
         month = extract_sheet_month(sheet_name)
         if month is None and "年度" not in sheet_name:
             continue
@@ -1638,6 +1648,38 @@ def workbook_sheet_xml_paths(archive: zipfile.ZipFile) -> dict[str, str]:
     return paths
 
 
+def create_trimmed_editing_copy(
+    source_path: Path,
+    output_path: Path,
+    keep_sheet_names: Iterable[str],
+) -> None:
+    keep_names = {clean_text(name) for name in keep_sheet_names if clean_text(name)}
+    empty_worksheet = (
+        b'<?xml version="1.0" encoding="utf-8"?>'
+        b'<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        b'<sheetData/></worksheet>'
+    )
+    with (
+        zipfile.ZipFile(source_path, "r") as source_archive,
+        zipfile.ZipFile(output_path, "w") as output_archive,
+    ):
+        sheet_paths = workbook_sheet_xml_paths(source_archive)
+        missing = keep_names - set(sheet_paths)
+        if missing:
+            raise ValueError(f"无法定位待回填工作表：{'、'.join(sorted(missing))}")
+        keep_paths = {path for name, path in sheet_paths.items() if name in keep_names}
+        all_sheet_paths = set(sheet_paths.values())
+        for item in source_archive.infolist():
+            if item.filename in all_sheet_paths and item.filename not in keep_paths:
+                data = empty_worksheet
+            else:
+                data = source_archive.read(item.filename)
+            output_archive.writestr(item, data)
+
+    if not zipfile.is_zipfile(output_path):
+        raise ValueError("创建低内存编辑副本失败。")
+
+
 def written_pair_coordinates(written_pairs: Iterable[str]) -> dict[str, set[str]]:
     coordinates: dict[str, set[str]] = defaultdict(set)
     for value in written_pairs:
@@ -1677,6 +1719,7 @@ def patch_sheet_xml_cells(
     coordinates: Iterable[str],
 ) -> bytes:
     source_text = source_xml.decode("utf-8")
+    original_source_text = source_text
     generated_text = generated_xml.decode("utf-8")
     target_coordinates = set(coordinates)
     for coordinate in sorted(
@@ -1710,24 +1753,25 @@ def patch_sheet_xml_cells(
         replacement = row_match.group(1) + patched_body + row_match.group(3)
         source_text = source_text[: row_match.start()] + replacement + source_text[row_match.end() :]
 
-    patched_xml = source_text.encode("utf-8")
-    source_cells = {
-        cell.attrib.get("r", ""): ET.tostring(cell, encoding="unicode")
-        for cell in ET.fromstring(source_xml).iter(
-            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"
-        )
-        if cell.attrib.get("r", "") not in target_coordinates
-    }
-    patched_cells = {
-        cell.attrib.get("r", ""): ET.tostring(cell, encoding="unicode")
-        for cell in ET.fromstring(patched_xml).iter(
-            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}c"
-        )
-        if cell.attrib.get("r", "") not in target_coordinates
-    }
-    if source_cells != patched_cells:
+    def protected_cells_digest(xml_text: str) -> tuple[int, bytes]:
+        digest = hashlib.sha256()
+        count = 0
+        for match in re.finditer(r'<c\b[^>]*?(?:/>|>.*?</c>)', xml_text, flags=re.DOTALL):
+            cell_xml = match.group(0)
+            coordinate_match = re.search(r'\br="([A-Z]{1,3}[1-9][0-9]*)"', cell_xml)
+            if coordinate_match is None or coordinate_match.group(1) in target_coordinates:
+                continue
+            encoded = cell_xml.encode("utf-8")
+            digest.update(len(encoded).to_bytes(8, "big"))
+            digest.update(encoded)
+            count += 1
+        return count, digest.digest()
+
+    source_digest = protected_cells_digest(original_source_text)
+    patched_digest = protected_cells_digest(source_text)
+    if source_digest != patched_digest:
         raise ValueError("检测到非预估单元格发生变化，为保护原始数据和公式已停止保存。")
-    return patched_xml
+    return source_text.encode("utf-8")
 
 
 def preserve_source_workbook_with_forecast_cells(
@@ -1791,18 +1835,31 @@ def save_sales_workbook(
     source_path: Optional[Path] = None,
     written_pairs: Optional[Iterable[str]] = None,
 ) -> None:
+    def release_workbook_memory() -> None:
+        worksheets = list(sales_wb.worksheets)
+        sales_wb.close()
+        for worksheet in worksheets:
+            cells = getattr(worksheet, "_cells", None)
+            if cells is not None:
+                cells.clear()
+        sheets = getattr(sales_wb, "_sheets", None)
+        if sheets is not None:
+            sheets.clear()
+        gc.collect()
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     source_path = Path(source_path) if source_path is not None else None
     written_pairs = list(written_pairs or [])
 
     if source_path is not None and not freeze_formulas and not written_pairs:
-        sales_wb.close()
+        release_workbook_memory()
         if source_path.resolve() != output_path.resolve():
             shutil.copy2(source_path, output_path)
         return
 
     if source_path is None or freeze_formulas:
         sales_wb.save(output_path)
+        release_workbook_memory()
         if freeze_formulas:
             freeze_workbook_inplace(output_path)
         return
@@ -1815,6 +1872,7 @@ def save_sales_workbook(
         generated_path = Path(temp_file.name)
     try:
         sales_wb.save(generated_path)
+        release_workbook_memory()
         preserve_source_workbook_with_forecast_cells(
             source_path,
             generated_path,
@@ -2000,6 +2058,87 @@ def filter_unmatched_prediction_months(
     return filtered
 
 
+def build_sales_scan_payload(
+    sales_path: Path,
+    business_owner: Optional[str],
+    current_month: int,
+) -> dict:
+    sales_values_wb = load_workbook(sales_path, read_only=False, data_only=True)
+    try:
+        fill_targets = select_relevant_fill_targets(
+            find_fill_targets(sales_values_wb),
+            current_month,
+        )
+        sales_codes = collect_sales_codes(
+            sales_values_wb,
+            business_owner=business_owner,
+            sheet_names={target.sheet for target in fill_targets},
+        )
+        previous_values = build_previous_estimate_cache(sales_values_wb, fill_targets)
+        return {
+            "sales_codes": sorted(sales_codes, key=normalize_code),
+            "fill_targets": [
+                {
+                    "sheet": target.sheet,
+                    "month": target.month,
+                    "label": target.label,
+                    "qty_col": target.qty_col,
+                    "amt_col": target.amt_col,
+                    "owner_col": target.owner_col,
+                    "code_col": target.code_col,
+                }
+                for target in fill_targets
+            ],
+            "previous_estimate_values": [
+                [sheet, qty_col, row, previous_qty, previous_amount]
+                for (sheet, qty_col, row), (previous_qty, previous_amount) in previous_values.items()
+            ],
+        }
+    finally:
+        sales_values_wb.close()
+
+
+def scan_sales_inputs_in_subprocess(
+    sales_path: Path,
+    business_owner: Optional[str],
+    current_month: int,
+) -> tuple[set[str], list[FillTarget], dict[tuple[str, int, int], tuple[Optional[float], Optional[float]]]]:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
+        payload_path = Path(temp_file.name)
+    try:
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--scan-sales",
+            str(sales_path),
+            business_owner or "",
+            str(current_month),
+            str(payload_path),
+        ]
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "未知错误").strip()[-1000:]
+            raise RuntimeError(f"读取共用销售排单失败：{detail}")
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    finally:
+        payload_path.unlink(missing_ok=True)
+
+    sales_codes = {clean_text(code) for code in payload.get("sales_codes", []) if clean_text(code)}
+    fill_targets = [FillTarget(**item) for item in payload.get("fill_targets", [])]
+    previous_estimate_values = {
+        (str(item[0]), int(item[1]), int(item[2])): (item[3], item[4])
+        for item in payload.get("previous_estimate_values", [])
+        if isinstance(item, list) and len(item) == 5
+    }
+    return sales_codes, fill_targets, previous_estimate_values
+
+
 def process_sales_workbooks(
     pred_path: Path | str = PRED_PATH,
     sales_path: Path | str = SALES_PATH,
@@ -2041,17 +2180,18 @@ def process_sales_workbooks(
         if clean_text(value)
     }
 
-    # Keep Render/free-server memory low: first read cached values for matching
-    # and price sources, release that workbook, then open the editable workbook.
+    # Scan the large workbook in a short-lived child process. Once it exits,
+    # its openpyxl memory is returned to the OS before the editable workbook is
+    # opened, which keeps Render's free worker below its memory limit.
     report_progress(5, "读取共用销售排单")
-    sales_values_wb = load_workbook(sales_path, read_only=False, data_only=True)
+    sales_codes, fill_targets, previous_estimate_values = scan_sales_inputs_in_subprocess(
+        sales_path,
+        business_owner,
+        as_of_date.month,
+    )
     report_progress(12, "读取销售排单客户机种")
-    sales_codes = collect_sales_codes(sales_values_wb, business_owner=business_owner)
     if not sales_codes:
         owner_note = f"（业务担当：{business_owner}）" if business_owner else ""
-        sales_values_wb.close()
-        del sales_values_wb
-        gc.collect()
         report_progress(90, "没有找到可匹配客户机种，生成未改动文件")
         sales_wb = load_workbook(sales_path)
         return unchanged_summary(
@@ -2075,9 +2215,6 @@ def process_sales_workbooks(
     )
     report_progress(32, "匹配预测机种与销售排单客户机种")
     if not predictions:
-        sales_values_wb.close()
-        del sales_values_wb
-        gc.collect()
         report_progress(90, "没有识别到可用预测，生成未改动文件")
         sales_wb = load_workbook(sales_path)
         return unchanged_summary(
@@ -2091,19 +2228,10 @@ def process_sales_workbooks(
             source_path=sales_path,
         )
 
-    fill_targets = select_relevant_fill_targets(
-        find_fill_targets(sales_values_wb),
-        as_of_date.month,
-    )
     report_progress(40, f"识别销售排单预估空白栏：{len(fill_targets)} 个")
-    previous_estimate_values = build_previous_estimate_cache(sales_values_wb, fill_targets)
-    sales_values_wb.close()
-    del sales_values_wb
-    gc.collect()
-
     report_progress(45, "打开可编辑销售排单")
-    sales_wb = load_workbook(sales_path)
     if not fill_targets:
+        sales_wb = load_workbook(sales_path)
         report_progress(90, "没有找到可回填预估空白栏，生成未改动文件")
         return unchanged_summary(
             sales_wb,
@@ -2114,6 +2242,26 @@ def process_sales_workbooks(
             "销售排单里没有找到空白的数量/金额栏，已生成未改动文件。",
             source_path=sales_path,
         )
+
+    if freeze_formulas:
+        sales_wb = load_workbook(sales_path)
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=output_path.parent,
+            suffix=sales_path.suffix or ".xlsx",
+        ) as temp_file:
+            editing_path = Path(temp_file.name)
+        try:
+            create_trimmed_editing_copy(
+                sales_path,
+                editing_path,
+                {target.sheet for target in fill_targets},
+            )
+            sales_wb = load_workbook(editing_path)
+        finally:
+            editing_path.unlink(missing_ok=True)
 
     updates = []
     fallbacks = []
@@ -2374,6 +2522,17 @@ def process_sales_workbooks(
 
 
 def main():
+    if len(sys.argv) == 6 and sys.argv[1] == "--scan-sales":
+        payload = build_sales_scan_payload(
+            Path(sys.argv[2]),
+            sys.argv[3] or None,
+            int(sys.argv[4]),
+        )
+        Path(sys.argv[5]).write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        return
     process_sales_workbooks()
 
 
