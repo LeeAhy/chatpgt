@@ -93,6 +93,11 @@ OWNER_STATUS_LABELS = {
     "done": "已完成",
     "error": "失败",
 }
+OWNER_STATUS_LIST_FIELDS = {
+    "unmatched_predictions",
+    "fill_target_months",
+    "written_pairs",
+}
 
 
 @lru_cache(maxsize=1)
@@ -471,6 +476,7 @@ def default_owner_statuses() -> dict[str, dict]:
             "unmatched_predictions": [],
             "fill_target_months": [],
             "matched_model_count": "",
+            "written_pairs": [],
         }
         for owner in BUSINESS_OWNERS
     }
@@ -489,7 +495,7 @@ def ensure_metadata_schema(metadata: dict) -> dict:
                 {
                     key: str(value)
                     for key, value in raw.items()
-                    if value is not None and key not in {"unmatched_predictions", "fill_target_months"}
+                    if value is not None and key not in OWNER_STATUS_LIST_FIELDS
                 }
             )
             raw_unmatched = raw.get("unmatched_predictions")
@@ -503,6 +509,13 @@ def ensure_metadata_schema(metadata: dict) -> dict:
                     int(month)
                     for month in raw_months
                     if str(month).isdigit() and 1 <= int(month) <= 12
+                ]
+            raw_written_pairs = raw.get("written_pairs")
+            if isinstance(raw_written_pairs, list):
+                normalized[owner]["written_pairs"] = [
+                    str(value)
+                    for value in raw_written_pairs
+                    if str(value).strip()
                 ]
             if normalized[owner].get("state") not in OWNER_STATUS_LABELS:
                 normalized[owner]["state"] = "pending"
@@ -523,12 +536,28 @@ def update_owner_status(owner: str, **values) -> None:
         metadata = ensure_metadata_schema(load_metadata())
         status = metadata["owner_statuses"].setdefault(owner, default_owner_statuses().get(owner, {}))
         for key, value in values.items():
-            if key in {"unmatched_predictions", "fill_target_months"}:
+            if key in OWNER_STATUS_LIST_FIELDS:
                 status[key] = value if isinstance(value, list) else []
             else:
                 status[key] = "" if value is None else str(value)
         metadata["owner_statuses"][owner] = status
         save_metadata(metadata)
+
+
+def owner_overwrite_context(owner: str) -> tuple[list[str], bool]:
+    """Return the cells this owner may replace on a repeated upload."""
+    with STATE_LOCK:
+        metadata = ensure_metadata_schema(load_metadata())
+        status = metadata["owner_statuses"].get(owner, {})
+        written_pairs = status.get("written_pairs")
+        if not isinstance(written_pairs, list):
+            written_pairs = []
+        has_previous_result = (
+            status.get("state") == "done"
+            or bool(str(status.get("updated_at") or "").strip())
+        )
+        normalized_pairs = [str(value) for value in written_pairs if str(value).strip()]
+        return normalized_pairs, has_previous_result and not normalized_pairs
 
 
 def get_job_status() -> dict:
@@ -1351,7 +1380,7 @@ def render_page(
     <section class="topline">
       <div>
         <h1>销售排单回填工作台</h1>
-        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；系统只写入当前空白的“预估”数量/金额栏，有预测依据的回填格标为浅蓝色，无匹配数据的机种写入 0，其他原始数据不修改。</p>
+        <p class="subtext">网站维护一份共用销售排单。每周先上传/替换本周排单，随后每位业务只上传自己的预测；首次上传只写入当前空白的“预估”数量/金额栏，同一业务重复上传时只覆盖该业务上一次由网站写入的预估格。匹配数据使用绿色字体，未取得预测数据写入黑色 0，所有回填格均无填充颜色，其他原始数据不修改。</p>
       </div>
       <div class="access">{html.escape(access_note)}<br><a href="/logout">安全退出</a></div>
     </section>
@@ -1404,7 +1433,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>系统以销售排单实际存在的预估空白栏月份为准；当月会扣减同一客户机种已完成数量。只有数量和金额都为空的预估格才会写入，已有值和其他原始数据绝不覆盖。</span>
+            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -1439,8 +1468,8 @@ def render_page(
         <span>每次只处理所选业务担当的销售排单行；无预测数据的预估空白格写入 0。</span>
       </div>
       <div class="summary-item">
-        <strong>扣已完成</strong>
-        <span>当月客户总预测会扣掉销售排单中已完成数量，再回填剩余预测。</span>
+        <strong>当月直接采用</strong>
+        <span>以北京时间判断当月；业务上传数量就是当月剩余预估，不再扣除之前已完成数量。</span>
       </div>
     </section>
   </main>
@@ -3411,7 +3440,12 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
         )
 
 
-def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
+def process_prediction_job(
+    selected_owner: str,
+    pred_path: Path,
+    overwrite_pairs: list[str],
+    allow_legacy_overwrite: bool,
+) -> None:
     def progress_callback(progress: dict) -> None:
         target_parts = []
         if progress.get("target_sheet"):
@@ -3462,7 +3496,10 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                 # request time out, so the website keeps formulas live.
                 freeze_formulas=False,
                 business_owner=selected_owner,
+                as_of_date=beijing_now().date(),
                 progress_callback=progress_callback,
+                overwrite_pairs=overwrite_pairs,
+                allow_legacy_overwrite=allow_legacy_overwrite,
             )
 
             with STATE_LOCK:
@@ -3490,18 +3527,19 @@ def process_prediction_job(selected_owner: str, pred_path: Path) -> None:
                     }
                 )
                 metadata = ensure_metadata_schema(metadata)
-                metadata["owner_statuses"][selected_owner].update(
-                    {
-                        "state": "done",
-                        "updated_rows": str(summary["updated_rows"]),
-                        "progress": "100",
-                        "updated_at": now_label(),
-                        "error": "",
-                        "unmatched_predictions": summary.get("unmatched_predictions", []),
-                        "fill_target_months": summary.get("fill_target_months", []),
-                        "matched_model_count": str(summary.get("matched_model_count", 0)),
-                    }
-                )
+                owner_result = {
+                    "state": "done",
+                    "updated_rows": str(summary["updated_rows"]),
+                    "progress": "100",
+                    "updated_at": now_label(),
+                    "error": "",
+                    "unmatched_predictions": summary.get("unmatched_predictions", []),
+                    "fill_target_months": summary.get("fill_target_months", []),
+                    "matched_model_count": str(summary.get("matched_model_count", 0)),
+                }
+                if summary.get("written_pairs"):
+                    owner_result["written_pairs"] = summary["written_pairs"]
+                metadata["owner_statuses"][selected_owner].update(owner_result)
                 save_metadata(metadata)
 
         set_job_status(
@@ -3571,6 +3609,8 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         if job_is_running():
             raise ValueError("上一份预测还在处理，请稍后刷新页面，完成后再上传下一位业务预测。")
 
+        overwrite_pairs, allow_legacy_overwrite = owner_overwrite_context(selected_owner)
+
         ensure_data_dir()
         pred_name = beijing_now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}{pred_suffix}"
         pred_path = UPLOAD_DIR / pred_name
@@ -3604,7 +3644,12 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
 
         worker = threading.Thread(
             target=process_prediction_job,
-            args=(selected_owner, pred_path),
+            args=(
+                selected_owner,
+                pred_path,
+                overwrite_pairs,
+                allow_legacy_overwrite,
+            ),
             daemon=True,
         )
         worker.start()

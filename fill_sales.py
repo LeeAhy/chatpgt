@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from copy import copy
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -15,6 +16,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from statistics import median
 from typing import Callable, Iterable, Optional
+from zoneinfo import ZoneInfo
 
 from runtime_bootstrap import ensure_bundled_python_path
 
@@ -43,11 +45,16 @@ SUPPORTED_SALES_SUFFIXES = SALES_EXCEL_SUFFIXES
 HEADER_SCAN_ROWS = 12
 DATA_START_ROW = 5
 NO_FILL_LABEL_WORDS = ("差异", "已完成", "实际")
-COMPLETED_LABEL_WORDS = ("已完成", "完成")
 MAX_FORMULA_RATIO = 0.2
 MIN_REASONABLE_PRICE = 0.01
 MAX_REASONABLE_PRICE = 1000.0
-MATCHED_FORECAST_FILL = PatternFill(fill_type="solid", fgColor="DDEBF7")
+NO_FORECAST_FILL = PatternFill(fill_type=None)
+# Use opaque ARGB values so Excel/WPS cannot interpret the font colors as
+# transparent or fall back to the workbook theme.
+MATCHED_FORECAST_FONT_COLOR = "FF008000"
+ZERO_FORECAST_FONT_COLOR = "FF000000"
+LEGACY_MATCHED_FORECAST_FILL_COLOR = "DDEBF7"
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 OCR_SOURCE_PATH = Path(__file__).with_name("ocr_image.m")
 OCR_BINARY_PATH = Path(tempfile.gettempdir()) / "sales_ocr_image"
 
@@ -1621,33 +1628,8 @@ def unchanged_summary(
         "fill_target_months": [],
         "matched_model_count": 0,
         "matched_customer_models": [],
+        "written_pairs": [],
     }
-
-
-def completed_qty_columns_before_target(ws, target: FillTarget) -> list[int]:
-    cols = []
-    for pair in find_quantity_amount_pairs(ws):
-        if pair.qty_col >= target.qty_col:
-            continue
-        if any(word in pair.label for word in COMPLETED_LABEL_WORDS):
-            cols.append(pair.qty_col)
-    return cols
-
-
-def completed_qty_for_row(vws, row: int, qty_cols: Iterable[int]) -> float:
-    total = 0.0
-    for col in qty_cols:
-        value = parse_number(vws.cell(row, col).value)
-        if value is not None:
-            total += value
-    return round(total, 4)
-
-
-def remaining_current_month_qty(
-    qty: float,
-    completed_qty: float,
-) -> float:
-    return round(max(qty - completed_qty, 0.0), 4)
 
 
 def previous_estimate_pair(ws, target: FillTarget) -> Optional[QuantityAmountPair]:
@@ -1706,6 +1688,67 @@ def cell_is_blank(value) -> bool:
     return value is None or (isinstance(value, str) and not value.strip())
 
 
+def apply_forecast_cell_style(cell, font_color: str) -> None:
+    font = copy(cell.font)
+    font.color = font_color
+    cell.font = font
+    cell.fill = NO_FORECAST_FILL
+
+
+def forecast_pair_key(sheet: str, row: int, qty_col: int, amt_col: int) -> str:
+    return (
+        f"{sheet}!{get_column_letter(qty_col)}{row}:"
+        f"{get_column_letter(amt_col)}{row}"
+    )
+
+
+def cell_rgb_suffix(cell) -> str:
+    color = getattr(cell.font, "color", None)
+    if color is None or getattr(color, "type", None) != "rgb":
+        return ""
+    rgb = clean_text(getattr(color, "rgb", "")).upper()
+    return rgb[-6:] if len(rgb) >= 6 else rgb
+
+
+def fill_rgb_suffix(cell) -> str:
+    fill = cell.fill
+    if getattr(fill, "fill_type", None) != "solid":
+        return ""
+    color = getattr(fill, "fgColor", None)
+    if color is None or getattr(color, "type", None) != "rgb":
+        return ""
+    rgb = clean_text(getattr(color, "rgb", "")).upper()
+    return rgb[-6:] if len(rgb) >= 6 else rgb
+
+
+def pair_has_legacy_generated_style(qty_cell, amt_cell) -> bool:
+    """Recognize cells produced before written-pair tracking was introduced."""
+    colors = {cell_rgb_suffix(qty_cell), cell_rgb_suffix(amt_cell)}
+    if colors and colors <= {"008000", "000000"} and "" not in colors:
+        return True
+    return any(
+        fill_rgb_suffix(cell) == LEGACY_MATCHED_FORECAST_FILL_COLOR
+        for cell in (qty_cell, amt_cell)
+    )
+
+
+def forecast_pair_is_writable(
+    sheet: str,
+    row: int,
+    target: FillTarget,
+    qty_cell,
+    amt_cell,
+    overwrite_pairs: set[str],
+    allow_legacy_overwrite: bool,
+) -> bool:
+    if cell_is_blank(qty_cell.value) and cell_is_blank(amt_cell.value):
+        return True
+    pair_key = forecast_pair_key(sheet, row, target.qty_col, target.amt_col)
+    if pair_key in overwrite_pairs:
+        return True
+    return allow_legacy_overwrite and pair_has_legacy_generated_style(qty_cell, amt_cell)
+
+
 def filter_unmatched_prediction_months(
     entries: Iterable[dict],
     allowed_months: Iterable[int],
@@ -1734,6 +1777,8 @@ def process_sales_workbooks(
     business_owner: Optional[str] = None,
     as_of_date: Optional[date] = None,
     progress_callback: Optional[Callable[[dict], None]] = None,
+    overwrite_pairs: Optional[Iterable[str]] = None,
+    allow_legacy_overwrite: bool = False,
 ):
     def report_progress(percent: int, step: str, target: Optional[FillTarget] = None) -> None:
         if progress_callback is None:
@@ -1758,7 +1803,12 @@ def process_sales_workbooks(
     pred_path = Path(pred_path)
     sales_path = Path(sales_path)
     output_path = Path(output_path)
-    as_of_date = as_of_date or date.today()
+    as_of_date = as_of_date or datetime.now(BEIJING_TZ).date()
+    overwrite_pair_keys = {
+        clean_text(value)
+        for value in (overwrite_pairs or [])
+        if clean_text(value)
+    }
 
     # Keep Render/free-server memory low: first read cached values for matching
     # and price sources, release that workbook, then open the editable workbook.
@@ -1838,6 +1888,7 @@ def process_sales_workbooks(
     completed_deductions = []
     skipped_existing_values = []
     zero_filled_rows = []
+    written_pairs: set[str] = set()
     matched_customer_models: set[str] = set()
     warnings = []
 
@@ -1852,11 +1903,6 @@ def process_sales_workbooks(
         vws = ws
         source_columns = find_header_columns(vws)
         source_code_columns = find_code_columns(vws, source_columns)
-        completed_qty_cols = (
-            completed_qty_columns_before_target(ws, target)
-            if target.month == as_of_date.month and business_owner != "周文龙"
-            else []
-        )
         code_to_row = {}
         normalized_code_to_code = {}
         row_meta = {}
@@ -1915,9 +1961,15 @@ def process_sales_workbooks(
             qty_cell = ws.cell(row, target.qty_col)
             amt_cell = ws.cell(row, target.amt_col)
 
-            qty_has_existing_value = not cell_is_blank(qty_cell.value)
-            amt_has_existing_value = not cell_is_blank(amt_cell.value)
-            if qty_has_existing_value or amt_has_existing_value:
+            if not forecast_pair_is_writable(
+                target.sheet,
+                row,
+                target,
+                qty_cell,
+                amt_cell,
+                overwrite_pair_keys,
+                allow_legacy_overwrite,
+            ):
                 skipped_existing_values.append(
                     (
                         target.sheet,
@@ -1930,16 +1982,9 @@ def process_sales_workbooks(
                 )
                 continue
 
-            original_qty = qty
-            completed_qty = completed_qty_for_row(vws, row, completed_qty_cols)
-            if completed_qty_cols:
-                qty = remaining_current_month_qty(qty, completed_qty)
-                if completed_qty:
-                    completed_deductions.append((target.sheet, target.label, code, original_qty, completed_qty, qty))
-
             qty_cell.value = qty
             qty_cell.number_format = "0.0000"
-            qty_cell.fill = MATCHED_FORECAST_FILL
+            apply_forecast_cell_style(qty_cell, MATCHED_FORECAST_FONT_COLOR)
 
             previous_qty, previous_amount = previous_estimate_values.get(
                 (target.sheet, target.qty_col, row),
@@ -1948,7 +1993,10 @@ def process_sales_workbooks(
             amount = amount_from_previous_week(qty, previous_qty, previous_amount)
             amt_cell.value = amount
             amt_cell.number_format = "0.00"
-            amt_cell.fill = MATCHED_FORECAST_FILL
+            apply_forecast_cell_style(amt_cell, MATCHED_FORECAST_FONT_COLOR)
+            written_pairs.add(
+                forecast_pair_key(target.sheet, row, target.qty_col, target.amt_col)
+            )
             matched_customer_models.add(clean_text(vws.cell(row, target.code_col).value) or matched_code)
             updates.append(
                 (
@@ -1965,16 +2013,30 @@ def process_sales_workbooks(
             )
 
         # Rows belonging to this owner but without a prediction for this target
-        # month receive 0/0 only when both forecast cells are still blank.
+        # month receive 0/0. On a repeat upload, only pairs previously written
+        # by the website may be replaced; original non-empty cells stay intact.
         for row in sorted(eligible_rows - matched_prediction_rows):
             qty_cell = ws.cell(row, target.qty_col)
             amt_cell = ws.cell(row, target.amt_col)
-            if not cell_is_blank(qty_cell.value) or not cell_is_blank(amt_cell.value):
+            if not forecast_pair_is_writable(
+                target.sheet,
+                row,
+                target,
+                qty_cell,
+                amt_cell,
+                overwrite_pair_keys,
+                allow_legacy_overwrite,
+            ):
                 continue
             qty_cell.value = 0
             qty_cell.number_format = "0.0000"
+            apply_forecast_cell_style(qty_cell, ZERO_FORECAST_FONT_COLOR)
             amt_cell.value = 0
             amt_cell.number_format = "0.00"
+            apply_forecast_cell_style(amt_cell, ZERO_FORECAST_FONT_COLOR)
+            written_pairs.add(
+                forecast_pair_key(target.sheet, row, target.qty_col, target.amt_col)
+            )
             zero_filled_rows.append(
                 (
                     target.sheet,
@@ -2020,6 +2082,7 @@ def process_sales_workbooks(
         "fill_target_months": fill_target_months,
         "matched_model_count": len(matched_customer_models),
         "matched_customer_models": sorted(matched_customer_models, key=normalize_code),
+        "written_pairs": sorted(written_pairs),
     }
 
     print(f"saved: {output_path}")
