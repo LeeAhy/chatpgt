@@ -956,55 +956,71 @@ def build_predictions_from_workbook(
     wb = load_workbook(pred_path, read_only=False, data_only=True)
     combined: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
     sheet_predictions_by_name: list[tuple[str, dict[str, dict[int, float]], list[dict]]] = []
-
-    for ws in wb.worksheets:
-        max_row = ws.max_row
-        max_col = ws.max_column
-        rows: list[list[str]] = []
-        for row_idx in range(1, max_row + 1):
-            rows.append([ws.cell(row_idx, col_idx).value for col_idx in range(1, max_col + 1)])
-
-        sheet_unmatched: list[dict] = []
-        sheet_predictions = build_predictions_from_rows(
-            rows,
-            sales_codes,
-            business_owner,
-            current_month,
-            unmatched_predictions=sheet_unmatched,
-            source_name=ws.title,
-        )
-        sheet_predictions_by_name.append((ws.title, sheet_predictions, sheet_unmatched))
-
-    if business_owner == "王永仁":
-        summary_predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
-
-        summary_unmatched: list[dict] = []
-        for sheet_name, sheet_predictions, sheet_unmatched in sheet_predictions_by_name:
-            is_summary_sheet = sheet_name in {"Sheet1", "按客户汇总"}
-            if not is_summary_sheet:
+    try:
+        for ws in wb.worksheets:
+            # Customer workbooks can contain formatting-only cells thousands
+            # of columns away from the real table. Scanning max_column would
+            # allocate millions of empty cells and exhaust a small web worker.
+            valued_cells = [cell for cell in ws._cells.values() if cell.value not in (None, "")]
+            if not valued_cells:
+                sheet_predictions_by_name.append((ws.title, {}, []))
                 continue
-            summary_unmatched.extend(sheet_unmatched)
+            max_row = max(cell.row for cell in valued_cells)
+            max_col = max(cell.column for cell in valued_cells)
+            rows = [
+                list(row)
+                for row in ws.iter_rows(
+                    min_row=1,
+                    max_row=max_row,
+                    min_col=1,
+                    max_col=max_col,
+                    values_only=True,
+                )
+            ]
+
+            sheet_unmatched: list[dict] = []
+            sheet_predictions = build_predictions_from_rows(
+                rows,
+                sales_codes,
+                business_owner,
+                current_month,
+                unmatched_predictions=sheet_unmatched,
+                source_name=ws.title,
+            )
+            sheet_predictions_by_name.append((ws.title, sheet_predictions, sheet_unmatched))
+
+        if business_owner == "王永仁":
+            summary_predictions: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+            summary_unmatched: list[dict] = []
+            for sheet_name, sheet_predictions, sheet_unmatched in sheet_predictions_by_name:
+                is_summary_sheet = sheet_name in {"Sheet1", "按客户汇总"}
+                if not is_summary_sheet:
+                    continue
+                summary_unmatched.extend(sheet_unmatched)
+                for code, month_map in sheet_predictions.items():
+                    for month, qty in month_map.items():
+                        summary_predictions[code][month] += qty
+
+            if summary_predictions:
+                if unmatched_predictions is not None:
+                    unmatched_predictions.extend(summary_unmatched)
+                return summary_predictions
+
+            # Some legacy Wang Yongren files do not have a summary sheet. Only then
+            # fall back to parsing all sheets, so detail tabs cannot override the
+            # auditable summary forecast in normal weekly files.
+
+        for _, sheet_predictions, sheet_unmatched in sheet_predictions_by_name:
+            if unmatched_predictions is not None:
+                unmatched_predictions.extend(sheet_unmatched)
             for code, month_map in sheet_predictions.items():
                 for month, qty in month_map.items():
-                    summary_predictions[code][month] += qty
+                    combined[code][month] += qty
 
-        if summary_predictions:
-            if unmatched_predictions is not None:
-                unmatched_predictions.extend(summary_unmatched)
-            return summary_predictions
-
-        # Some legacy Wang Yongren files do not have a summary sheet. Only then
-        # fall back to parsing all sheets, so detail tabs cannot override the
-        # auditable summary forecast in normal weekly files.
-
-    for _, sheet_predictions, sheet_unmatched in sheet_predictions_by_name:
-        if unmatched_predictions is not None:
-            unmatched_predictions.extend(sheet_unmatched)
-        for code, month_map in sheet_predictions.items():
-            for month, qty in month_map.items():
-                combined[code][month] += qty
-
-    return combined
+        return combined
+    finally:
+        wb.close()
 
 
 def build_predictions_from_text_file(
