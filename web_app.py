@@ -60,6 +60,8 @@ REMOTE_MASTER_KEY = "current_sales.xlsx"
 REMOTE_LATEST_KEY = "latest_generated.xlsx"
 REMOTE_METADATA_KEY = "metadata.json"
 REMOTE_CHUNK_SIZE = 2 * 1024 * 1024
+REMOTE_REQUEST_ATTEMPTS = 3
+REMOTE_RETRYABLE_HTTP_CODES = {408, 425, 429, 500, 502, 503, 504}
 LOGIN_USERNAME = os.environ.get("SALES_LOGIN_USERNAME", "admin").strip()
 LOGIN_PASSWORD = os.environ.get("SALES_LOGIN_PASSWORD", "")
 LOGIN_SECRET = os.environ.get("SALES_LOGIN_SECRET", "").strip() or REMOTE_STORAGE_SECRET
@@ -329,22 +331,36 @@ def remote_request(
     headers = {"x-sales-storage-secret": REMOTE_STORAGE_SECRET}
     if data is not None:
         headers["Content-Type"] = content_type
-    request = urllib.request.Request(
-        remote_storage_url(key),
-        data=data,
-        headers=headers,
-        method=method,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404 and method == "GET":
-            return None
-        error_body = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"Netlify Blobs 请求失败：HTTP {exc.code} {error_body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"连接 Netlify Blobs 失败：{exc.reason}") from exc
+    last_error: Optional[Exception] = None
+    for attempt in range(1, REMOTE_REQUEST_ATTEMPTS + 1):
+        request = urllib.request.Request(
+            remote_storage_url(key),
+            data=data,
+            headers=headers,
+            method=method,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404 and method == "GET":
+                return None
+            error_body = exc.read().decode("utf-8", errors="replace")[:500]
+            last_error = RuntimeError(
+                f"Netlify Blobs 请求失败：HTTP {exc.code} {error_body}"
+            )
+            if exc.code not in REMOTE_RETRYABLE_HTTP_CODES:
+                raise last_error from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            last_error = RuntimeError(f"连接 Netlify Blobs 失败：{reason}")
+
+        if attempt < REMOTE_REQUEST_ATTEMPTS:
+            time.sleep(attempt)
+
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def remote_put_file(key: str, path: Path, content_type: str = XLSX_MIME) -> None:
@@ -441,15 +457,15 @@ def hydrate_remote_state() -> None:
     if not MASTER_SALES_PATH.exists():
         remote_get_file(REMOTE_MASTER_KEY, MASTER_SALES_PATH)
     if MASTER_SALES_PATH.exists() and not LATEST_OUTPUT_PATH.exists():
-        if not remote_get_file(REMOTE_LATEST_KEY, LATEST_OUTPUT_PATH):
-            shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+        shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
 
 
 def sync_master_files_to_remote() -> None:
     if not remote_storage_enabled():
         return
+    # Both local paths contain the same latest workbook. Uploading it once
+    # halves the remote requests and avoids unnecessary free-instance delays.
     remote_put_file(REMOTE_MASTER_KEY, MASTER_SALES_PATH)
-    remote_put_file(REMOTE_LATEST_KEY, LATEST_OUTPUT_PATH)
 
 
 def load_metadata() -> dict:
@@ -477,6 +493,7 @@ def default_owner_statuses() -> dict[str, dict]:
             "fill_target_months": [],
             "matched_model_count": "",
             "written_pairs": [],
+            "storage_warning": "",
         }
         for owner in BUSINESS_OWNERS
     }
@@ -524,11 +541,23 @@ def ensure_metadata_schema(metadata: dict) -> dict:
     return metadata
 
 
-def save_metadata(metadata: dict) -> None:
+def save_metadata(metadata: dict) -> str:
     ensure_data_dir()
     metadata = ensure_metadata_schema(metadata)
     METADATA_PATH.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-    remote_put_json(REMOTE_METADATA_KEY, metadata)
+    try:
+        remote_put_json(REMOTE_METADATA_KEY, metadata)
+    except Exception as exc:  # noqa: BLE001
+        warning = f"状态远程备份暂时失败：{exc}"
+        metadata["storage_warning"] = warning
+        metadata["storage_warning_at"] = now_label()
+        METADATA_PATH.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(warning)
+        return warning
+    return ""
 
 
 def update_owner_status(owner: str, **values) -> None:
@@ -673,6 +702,13 @@ def render_page(
     latest_rows = metadata.get("last_updated_rows", "")
     latest_models = metadata.get("last_matched_model_count", "")
     latest_file = metadata.get("latest_name", metadata.get("master_name", "最新销售排单.xlsx"))
+    storage_warning = str(metadata.get("storage_warning") or "").strip()
+    storage_warning_html = (
+        f'<div class="notice working" role="status">{html.escape(storage_warning)}。'
+        '当前最新版仍可下载和继续回填，后续保存会自动再次尝试远程备份。</div>'
+        if storage_warning
+        else ""
+    )
     master_status = "已启用" if has_master else "待上传"
     master_status_class = "ready" if has_master else "empty"
     download_latest_html = (
@@ -713,6 +749,7 @@ def render_page(
         uploaded_at = status.get("uploaded_at") or status.get("updated_at") or ""
         done_at = status.get("updated_at") or ""
         error_text = status.get("error") or ""
+        owner_storage_warning = status.get("storage_warning") or ""
         unmatched_items = status.get("unmatched_predictions")
         unmatched_count = len(unmatched_items) if isinstance(unmatched_items, list) else 0
         owner_status_card_items.append(
@@ -724,6 +761,7 @@ def render_page(
             f'<small>回填结果：{row_text}{("，" + html.escape(done_at)) if done_at else ""}</small>'
             f'<small>未匹配：{unmatched_count} 项</small>'
             f'{f"<small>错误：{html.escape(error_text)}</small>" if error_text else ""}'
+            f'{f"<small>备份提示：{html.escape(owner_storage_warning)}</small>" if owner_storage_warning else ""}'
             f'</div>'
         )
     owner_status_cards = "\n".join(owner_status_card_items)
@@ -829,10 +867,18 @@ def render_page(
             if str(completed_count) != ""
             else f'更新 {html.escape(str(job.get("updated_rows", "")))} 行'
         )
+        job_storage_warning = str(job.get("storage_warning") or "").strip()
+        job_storage_warning_html = (
+            f'<div class="notice working" role="status">'
+            f'{html.escape(job_storage_warning)}。当前最新版仍可下载。</div>'
+            if job_storage_warning
+            else ""
+        )
         job_html = (
             f'<div class="notice success" role="status">最近处理完成：{html.escape(job.get("owner", ""))}，'
             f'{completed_text}，'
             f'{html.escape(job.get("finished_at", ""))}。可以下载当前最新版。</div>'
+            f'{job_storage_warning_html}'
         )
         refresh_meta = ""
     elif job_state == "error":
@@ -1429,6 +1475,7 @@ def render_page(
         </div>
         {message_html}
         {error_html}
+        {storage_warning_html}
         {job_html}
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
@@ -3376,6 +3423,8 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
         )
         return
 
+    backup_path: Optional[Path] = None
+    storage_warning = ""
     try:
         if job_is_running():
             raise ValueError("当前有预测正在后台回填，请处理完成后再替换共用销售排单。")
@@ -3407,24 +3456,36 @@ def handle_sales_master(handler: BaseHTTPRequestHandler, head: bool = False) -> 
             save_upload(sales_field, MASTER_SALES_PATH)
             validate_excel_file(MASTER_SALES_PATH, "共用销售排单")
             shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
-            sync_master_files_to_remote()
-            save_metadata(
-                {
-                    "master_name": original_name,
-                    "master_uploaded_at": now_label(),
-                    "latest_name": f"{Path(original_name).stem}_当前最新版.xlsx",
-                    "last_owner": "",
-                    "last_generated_at": "",
-                    "last_updated_rows": "",
-                    "owner_statuses": default_owner_statuses(),
-                }
-            )
+            try:
+                sync_master_files_to_remote()
+            except Exception as exc:  # noqa: BLE001
+                storage_warning = f"共用排单已保存，但远程备份暂时失败：{exc}"
+                print(storage_warning)
+            metadata = {
+                "master_name": original_name,
+                "master_uploaded_at": now_label(),
+                "latest_name": f"{Path(original_name).stem}_当前最新版.xlsx",
+                "last_owner": "",
+                "last_generated_at": "",
+                "last_updated_rows": "",
+                "owner_statuses": default_owner_statuses(),
+                "storage_warning": storage_warning,
+                "storage_warning_at": now_label() if storage_warning else "",
+            }
+            metadata_warning = save_metadata(metadata)
+            if metadata_warning:
+                storage_warning = "；".join(
+                    value for value in (storage_warning, metadata_warning) if value
+                )
 
+        message_text = f"共用销售排单已保存：{original_name}。现在各业务只需要上传自己的预测。"
+        if storage_warning:
+            message_text += " 当前文件可继续使用，网站会在后续保存时再次尝试远程备份。"
         write_html(
             handler,
             200,
             render_page(
-                message=f"共用销售排单已保存：{original_name}。现在各业务只需要上传自己的预测。",
+                message=message_text,
                 handler=handler,
             ).decode("utf-8"),
             head=head,
@@ -3450,6 +3511,8 @@ def process_prediction_job(
     overwrite_pairs: list[str],
     allow_legacy_overwrite: bool,
 ) -> None:
+    storage_warning = ""
+
     def progress_callback(progress: dict) -> None:
         target_parts = []
         if progress.get("target_sheet"):
@@ -3472,6 +3535,7 @@ def process_prediction_job(
         finished_at="",
         updated_rows="",
         error="",
+        storage_warning="",
         progress="1",
         step="准备处理上传文件",
         target="",
@@ -3515,7 +3579,11 @@ def process_prediction_job(
                 shutil.copy2(output_path, MASTER_SALES_PATH)
                 shutil.copy2(output_path, LATEST_OUTPUT_PATH)
                 set_job_status(progress="98", step="同步保存共享网站数据", target="")
-                sync_master_files_to_remote()
+                try:
+                    sync_master_files_to_remote()
+                except Exception as exc:  # noqa: BLE001
+                    storage_warning = f"Excel 已回填完成，但远程备份暂时失败：{exc}"
+                    print(storage_warning)
 
                 metadata = load_metadata()
                 master_name = metadata.get("master_name", "销售排单.xlsx")
@@ -3528,6 +3596,8 @@ def process_prediction_job(
                         "last_generated_at": now_label(),
                         "last_updated_rows": summary["updated_rows"],
                         "last_matched_model_count": summary.get("matched_model_count", 0),
+                        "storage_warning": storage_warning,
+                        "storage_warning_at": now_label() if storage_warning else "",
                     }
                 )
                 metadata = ensure_metadata_schema(metadata)
@@ -3540,20 +3610,26 @@ def process_prediction_job(
                     "unmatched_predictions": summary.get("unmatched_predictions", []),
                     "fill_target_months": summary.get("fill_target_months", []),
                     "matched_model_count": str(summary.get("matched_model_count", 0)),
+                    "storage_warning": storage_warning,
                 }
                 if summary.get("written_pairs"):
                     owner_result["written_pairs"] = summary["written_pairs"]
                 metadata["owner_statuses"][selected_owner].update(owner_result)
-                save_metadata(metadata)
+                metadata_warning = save_metadata(metadata)
+                if metadata_warning:
+                    storage_warning = "；".join(
+                        value for value in (storage_warning, metadata_warning) if value
+                    )
 
         set_job_status(
             state="done",
             owner=selected_owner,
-            message="处理完成",
+            message="处理完成" if not storage_warning else "回填完成，远程备份待恢复",
             finished_at=now_label(),
             updated_rows=summary["updated_rows"],
             matched_model_count=summary.get("matched_model_count", 0),
             error="",
+            storage_warning=storage_warning,
             progress="100",
             step="处理完成",
             target="",
@@ -3629,6 +3705,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             updated_at="",
             prediction_name=safe_filename(pred_field.filename, "预测文件"),
             error="",
+            storage_warning="",
             unmatched_predictions=[],
             fill_target_months=[],
             matched_model_count="",
@@ -3641,6 +3718,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             finished_at="",
             updated_rows="",
             error="",
+            storage_warning="",
             progress="1",
             step="已收到预测文件，等待后台处理",
             target="",
@@ -3756,6 +3834,7 @@ class SalesUploadHandler(BaseHTTPRequestHandler):
                     "last_owner": metadata.get("last_owner", ""),
                     "last_generated_at": metadata.get("last_generated_at", ""),
                     "last_updated_rows": metadata.get("last_updated_rows", ""),
+                    "storage_warning": metadata.get("storage_warning", ""),
                     "owner_statuses": metadata.get("owner_statuses", default_owner_statuses()),
                     "data_dir": str(DATA_DIR),
                     "storage": storage_description(),

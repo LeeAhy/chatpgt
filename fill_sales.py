@@ -4,10 +4,13 @@ import csv
 import gc
 import math
 import os
+import posixpath
 import re
 import shutil
 import subprocess
 import tempfile
+import zipfile
+import xml.etree.ElementTree as ET
 from copy import copy
 from collections import defaultdict
 from dataclasses import dataclass
@@ -24,7 +27,7 @@ ensure_bundled_python_path()
 
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 
 from freeze_formulas import freeze_workbook_inplace
 
@@ -1595,15 +1598,196 @@ def choose_fallback_price(target_meta, candidate_rows, price_map, business_owner
     return best
 
 
+def workbook_sheet_xml_paths(archive: zipfile.ZipFile) -> dict[str, str]:
+    workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+    rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    rel_targets = {
+        rel.attrib.get("Id", ""): rel.attrib.get("Target", "")
+        for rel in rels_root
+    }
+    relationship_id = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+    paths = {}
+    for sheet in workbook_root.findall(
+        ".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}sheet"
+    ):
+        sheet_name = sheet.attrib.get("name", "")
+        target = rel_targets.get(sheet.attrib.get(relationship_id, ""), "")
+        if not sheet_name or not target:
+            continue
+        if target.startswith("/"):
+            archive_path = target.lstrip("/")
+        else:
+            archive_path = posixpath.normpath(posixpath.join("xl", target))
+        paths[sheet_name] = archive_path
+    return paths
+
+
+def written_pair_coordinates(written_pairs: Iterable[str]) -> dict[str, set[str]]:
+    coordinates: dict[str, set[str]] = defaultdict(set)
+    for value in written_pairs:
+        sheet_name, separator, cell_range = clean_text(value).rpartition("!")
+        if not separator or not sheet_name or not cell_range:
+            continue
+        start, _, end = cell_range.partition(":")
+        for coordinate in (start, end or start):
+            coordinate = coordinate.strip().upper()
+            if re.fullmatch(r"[A-Z]{1,3}[1-9][0-9]*", coordinate):
+                coordinates[sheet_name].add(coordinate)
+    return coordinates
+
+
+def cell_xml_pattern(coordinate: str) -> re.Pattern[str]:
+    return re.compile(
+        rf'<c\b(?=[^>]*\br="{re.escape(coordinate)}")[^>]*(?:/>|>.*?</c>)',
+        re.DOTALL,
+    )
+
+
+def insert_cell_xml_into_row(row_body: str, coordinate: str, cell_xml: str) -> str:
+    target_column = column_index_from_string(re.match(r"[A-Z]+", coordinate).group(0))
+    for match in re.finditer(r'<c\b[^>]*\br="([A-Z]{1,3}[1-9][0-9]*)"[^>]*', row_body):
+        existing_coordinate = match.group(1)
+        existing_column = column_index_from_string(
+            re.match(r"[A-Z]+", existing_coordinate).group(0)
+        )
+        if existing_column > target_column:
+            return row_body[: match.start()] + cell_xml + row_body[match.start() :]
+    return row_body + cell_xml
+
+
+def patch_sheet_xml_cells(
+    source_xml: bytes,
+    generated_xml: bytes,
+    coordinates: Iterable[str],
+) -> bytes:
+    source_text = source_xml.decode("utf-8")
+    generated_text = generated_xml.decode("utf-8")
+    for coordinate in sorted(
+        set(coordinates),
+        key=lambda value: (int(re.search(r"[0-9]+", value).group(0)), column_index_from_string(re.match(r"[A-Z]+", value).group(0))),
+    ):
+        pattern = cell_xml_pattern(coordinate)
+        generated_match = pattern.search(generated_text)
+        if generated_match is None:
+            raise ValueError(f"生成文件缺少预估单元格 {coordinate}，为保护原表已停止保存。")
+        generated_cell = generated_match.group(0)
+        if pattern.search(source_text):
+            source_text = pattern.sub(lambda _match: generated_cell, source_text, count=1)
+            continue
+
+        row_number = re.search(r"[0-9]+", coordinate).group(0)
+        row_pattern = re.compile(
+            rf'(<row\b(?=[^>]*\br="{row_number}")[^>]*>)(.*?)(</row>)',
+            re.DOTALL,
+        )
+        row_match = row_pattern.search(source_text)
+        if row_match is None:
+            raise ValueError(
+                f"原始排单缺少 {coordinate} 所在的数据行，为保护原表已停止保存。"
+            )
+        patched_body = insert_cell_xml_into_row(
+            row_match.group(2),
+            coordinate,
+            generated_cell,
+        )
+        replacement = row_match.group(1) + patched_body + row_match.group(3)
+        source_text = source_text[: row_match.start()] + replacement + source_text[row_match.end() :]
+    return source_text.encode("utf-8")
+
+
+def preserve_source_workbook_with_forecast_cells(
+    source_path: Path,
+    generated_path: Path,
+    output_path: Path,
+    written_pairs: Iterable[str],
+) -> None:
+    coordinates_by_sheet = written_pair_coordinates(written_pairs)
+    if not coordinates_by_sheet:
+        if source_path.resolve() != output_path.resolve():
+            shutil.copy2(source_path, output_path)
+        return
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=output_path.parent,
+        suffix=output_path.suffix or ".xlsx",
+    ) as temp_file:
+        patched_path = Path(temp_file.name)
+
+    try:
+        with (
+            zipfile.ZipFile(source_path, "r") as source_archive,
+            zipfile.ZipFile(generated_path, "r") as generated_archive,
+            zipfile.ZipFile(patched_path, "w") as output_archive,
+        ):
+            source_sheet_paths = workbook_sheet_xml_paths(source_archive)
+            generated_sheet_paths = workbook_sheet_xml_paths(generated_archive)
+            replacements: dict[str, bytes] = {
+                "xl/styles.xml": generated_archive.read("xl/styles.xml")
+            }
+            for sheet_name, coordinates in coordinates_by_sheet.items():
+                source_sheet_path = source_sheet_paths.get(sheet_name)
+                generated_sheet_path = generated_sheet_paths.get(sheet_name)
+                if not source_sheet_path or not generated_sheet_path:
+                    raise ValueError(f"无法定位工作表“{sheet_name}”，为保护原表已停止保存。")
+                replacements[source_sheet_path] = patch_sheet_xml_cells(
+                    source_archive.read(source_sheet_path),
+                    generated_archive.read(generated_sheet_path),
+                    coordinates,
+                )
+
+            for item in source_archive.infolist():
+                output_archive.writestr(
+                    item,
+                    replacements.get(item.filename, source_archive.read(item.filename)),
+                )
+
+        if not zipfile.is_zipfile(patched_path):
+            raise ValueError("保存后的 Excel 文件结构无效，为保护原表已停止替换。")
+        patched_path.replace(output_path)
+    finally:
+        patched_path.unlink(missing_ok=True)
+
+
 def save_sales_workbook(
     sales_wb,
     output_path: Path,
     freeze_formulas: bool,
+    source_path: Optional[Path] = None,
+    written_pairs: Optional[Iterable[str]] = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    sales_wb.save(output_path)
-    if freeze_formulas:
-        freeze_workbook_inplace(output_path)
+    source_path = Path(source_path) if source_path is not None else None
+    written_pairs = list(written_pairs or [])
+
+    if source_path is not None and not freeze_formulas and not written_pairs:
+        sales_wb.close()
+        if source_path.resolve() != output_path.resolve():
+            shutil.copy2(source_path, output_path)
+        return
+
+    if source_path is None or freeze_formulas:
+        sales_wb.save(output_path)
+        if freeze_formulas:
+            freeze_workbook_inplace(output_path)
+        return
+
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=output_path.parent,
+        suffix=output_path.suffix or ".xlsx",
+    ) as temp_file:
+        generated_path = Path(temp_file.name)
+    try:
+        sales_wb.save(generated_path)
+        preserve_source_workbook_with_forecast_cells(
+            source_path,
+            generated_path,
+            output_path,
+            written_pairs,
+        )
+    finally:
+        generated_path.unlink(missing_ok=True)
 
 
 def unchanged_summary(
@@ -1614,8 +1798,14 @@ def unchanged_summary(
     as_of_date: date,
     warning: str,
     unmatched_predictions: Optional[list[dict]] = None,
+    source_path: Optional[Path] = None,
 ) -> dict:
-    save_sales_workbook(sales_wb, output_path, freeze_formulas)
+    save_sales_workbook(
+        sales_wb,
+        output_path,
+        freeze_formulas,
+        source_path=source_path,
+    )
     return {
         "output_path": output_path,
         "updated_rows": 0,
@@ -1836,6 +2026,7 @@ def process_sales_workbooks(
             business_owner,
             as_of_date,
             f"销售排单里没有找到可匹配的客户机种{owner_note}，已生成未改动文件。",
+            source_path=sales_path,
         )
 
     report_progress(22, "读取业务预测文件")
@@ -1862,6 +2053,7 @@ def process_sales_workbooks(
             as_of_date,
             "预测信息里没有识别到可用的机种和数量，已生成未改动文件。",
             unmatched_predictions=unmatched_predictions,
+            source_path=sales_path,
         )
 
     fill_targets = select_relevant_fill_targets(
@@ -1885,6 +2077,7 @@ def process_sales_workbooks(
             business_owner,
             as_of_date,
             "销售排单里没有找到空白的数量/金额栏，已生成未改动文件。",
+            source_path=sales_path,
         )
 
     updates = []
@@ -2080,7 +2273,13 @@ def process_sales_workbooks(
         calc.forceFullCalc = True
 
     report_progress(88, "保存共用销售排单最新版")
-    save_sales_workbook(sales_wb, output_path, freeze_formulas)
+    save_sales_workbook(
+        sales_wb,
+        output_path,
+        freeze_formulas,
+        source_path=sales_path,
+        written_pairs=written_pairs,
+    )
     report_progress(96, "整理回填结果")
 
     fill_target_months = sorted({target.month for target in fill_targets})
