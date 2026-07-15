@@ -49,6 +49,7 @@ MAX_FORMULA_RATIO = 0.2
 MIN_REASONABLE_PRICE = 0.01
 MAX_REASONABLE_PRICE = 1000.0
 NO_FORECAST_FILL = PatternFill(fill_type=None)
+INVALID_AMOUNT_FILL = PatternFill(fill_type="solid", fgColor="FF8B0000")
 # Use opaque ARGB values so Excel/WPS cannot interpret the font colors as
 # transparent or fall back to the workbook theme.
 MATCHED_FORECAST_FONT_COLOR = "FF008000"
@@ -59,7 +60,7 @@ OCR_SOURCE_PATH = Path(__file__).with_name("ocr_image.m")
 OCR_BINARY_PATH = Path(tempfile.gettempdir()) / "sales_ocr_image"
 
 OWNER_PREDICTION_RULES = {
-    "洪鸣": {"headers": ("New part NO",), "prefix": False, "unit": "pcs"},
+    "洪鸣": {"headers": ("New part NO",), "prefix": False, "unit": "wan"},
     "李玎玲": {"headers": ("机种名",), "prefix": False, "unit": "k"},
     "周文龙": {"headers": ("HIR料号", "品民", "品名"), "prefix": False, "unit": "pcs"},
     "王永仁": {"headers": ("子件描述",), "prefix": True, "unit": "pcs"},
@@ -242,6 +243,8 @@ def prediction_qty_to_wanpcs(value, business_owner: Optional[str]) -> Optional[f
     rule = OWNER_PREDICTION_RULES.get(business_owner or "", DEFAULT_PREDICTION_RULE)
     if rule.get("unit") == "k" and not explicit_unit:
         return round(num / 10.0, 4)
+    if rule.get("unit") == "wan" and not explicit_unit:
+        return round(num, 4)
 
     return month_qty_to_wanpcs(num)
 
@@ -1629,6 +1632,7 @@ def unchanged_summary(
         "matched_model_count": 0,
         "matched_customer_models": [],
         "written_pairs": [],
+        "invalid_amount_rows": [],
     }
 
 
@@ -1669,10 +1673,12 @@ def amount_from_previous_week(
     qty: float,
     previous_qty: Optional[float],
     previous_amount: Optional[float],
-) -> float:
-    if previous_qty is None or previous_amount is None or previous_qty == 0:
-        return 0.0
-    return round(qty * previous_amount / previous_qty, 4)
+) -> tuple[float, bool]:
+    if previous_qty == 0:
+        return 0.0, True
+    if previous_qty is None or previous_amount is None:
+        return 0.0, False
+    return round(qty * previous_amount / previous_qty, 4), False
 
 
 def cell_has_existing_nonzero_value(value) -> bool:
@@ -1889,6 +1895,7 @@ def process_sales_workbooks(
     skipped_existing_values = []
     zero_filled_rows = []
     written_pairs: set[str] = set()
+    invalid_amount_rows = []
     matched_customer_models: set[str] = set()
     warnings = []
 
@@ -1990,10 +1997,25 @@ def process_sales_workbooks(
                 (target.sheet, target.qty_col, row),
                 (None, None),
             )
-            amount = amount_from_previous_week(qty, previous_qty, previous_amount)
+            amount, invalid_previous_qty = amount_from_previous_week(
+                qty,
+                previous_qty,
+                previous_amount,
+            )
             amt_cell.value = amount
             amt_cell.number_format = "0.00"
             apply_forecast_cell_style(amt_cell, MATCHED_FORECAST_FONT_COLOR)
+            if invalid_previous_qty:
+                amt_cell.fill = INVALID_AMOUNT_FILL
+                invalid_amount_rows.append(
+                    (
+                        target.sheet,
+                        row,
+                        code,
+                        target.label,
+                        get_column_letter(target.amt_col),
+                    )
+                )
             written_pairs.add(
                 forecast_pair_key(target.sheet, row, target.qty_col, target.amt_col)
             )
@@ -2083,6 +2105,7 @@ def process_sales_workbooks(
         "matched_model_count": len(matched_customer_models),
         "matched_customer_models": sorted(matched_customer_models, key=normalize_code),
         "written_pairs": sorted(written_pairs),
+        "invalid_amount_rows": invalid_amount_rows,
     }
 
     print(f"saved: {output_path}")
@@ -2110,6 +2133,7 @@ def process_sales_workbooks(
     print(f"completed deductions: {len(completed_deductions)}")
     for item in completed_deductions[:20]:
         print("completed_deduction", item)
+    print(f"invalid previous-week quantity amounts: {len(invalid_amount_rows)}")
     print(f"unmatched predictions with quantities: {len(summary['unmatched_predictions'])}")
 
     return summary

@@ -80,7 +80,7 @@ JOB_STATUS = {
     "target": "",
 }
 OWNER_GUIDES = {
-    "洪鸣": "读取预测文件中的 New part NO 匹配销售排单“客户机种”。",
+    "洪鸣": "读取预测文件中的 New part NO 匹配销售排单“客户机种”；上传数量单位按万 pcs 直接使用。",
     "李玎玲": "优先识别截图里的“机种名”和 6-10 月预测数量，自动匹配销售排单“客户机种”；数量单位 K 会自动换算成万 pcs。",
     "周文龙": "读取预测文件中的“品名”匹配销售排单“客户机种”；允许唯一、可信的缩写或近似机种匹配。",
     "王永仁": "读取预测文件中的“子件描述”前缀匹配销售排单“客户机种”；允许唯一版本升级和可信近似机种匹配。",
@@ -1433,7 +1433,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。</span>
+            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。若上周数量为 0，本周金额写 0 并使用深红色背景提示无法计算单价。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -1470,6 +1470,10 @@ def render_page(
       <div class="summary-item">
         <strong>当月直接采用</strong>
         <span>以北京时间判断当月；业务上传数量就是当月剩余预估，不再扣除之前已完成数量。</span>
+      </div>
+      <div class="summary-item">
+        <strong>金额异常提示</strong>
+        <span>上周数量为 0 时，本周金额写 0，并用深红色背景标记无法计算单价。</span>
       </div>
     </section>
   </main>
