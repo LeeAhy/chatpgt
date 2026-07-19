@@ -581,12 +581,11 @@ def owner_overwrite_context(owner: str) -> tuple[list[str], bool]:
         written_pairs = status.get("written_pairs")
         if not isinstance(written_pairs, list):
             written_pairs = []
-        has_previous_result = (
-            status.get("state") == "done"
-            or bool(str(status.get("updated_at") or "").strip())
-        )
         normalized_pairs = [str(value) for value in written_pairs if str(value).strip()]
-        return normalized_pairs, has_previous_result and not normalized_pairs
+        # Never infer writable cells from formatting or an old completion flag.
+        # Only coordinates explicitly recorded after a website write may be
+        # overwritten by a repeated upload from the same owner.
+        return normalized_pairs, False
 
 
 def get_job_status() -> dict:
@@ -3613,7 +3612,16 @@ def process_prediction_job(
                     "storage_warning": storage_warning,
                 }
                 if summary.get("written_pairs"):
-                    owner_result["written_pairs"] = summary["written_pairs"]
+                    previous_pairs = metadata["owner_statuses"][selected_owner].get("written_pairs", [])
+                    if not isinstance(previous_pairs, list):
+                        previous_pairs = []
+                    owner_result["written_pairs"] = sorted(
+                        {
+                            str(value)
+                            for value in [*previous_pairs, *summary["written_pairs"]]
+                            if str(value).strip()
+                        }
+                    )
                 metadata["owner_statuses"][selected_owner].update(owner_result)
                 metadata_warning = save_metadata(metadata)
                 if metadata_warning:

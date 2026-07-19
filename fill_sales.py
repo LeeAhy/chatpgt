@@ -1919,19 +1919,18 @@ def unchanged_summary(
     }
 
 
-def previous_estimate_pair(ws, target: FillTarget) -> Optional[QuantityAmountPair]:
+def historical_quantity_amount_pairs(ws, target: FillTarget) -> list[QuantityAmountPair]:
+    """Return earlier business quantity/amount pairs, newest first."""
     candidates = []
     for pair in find_quantity_amount_pairs(ws):
         if pair.qty_col >= target.qty_col:
             continue
-        if "预估" not in pair.label:
-            continue
-        if any(word in pair.label for word in NO_FILL_LABEL_WORDS):
+        # Difference columns are arithmetic results rather than a historical
+        # quantity/amount transaction and must never be used as a unit price.
+        if "差异" in pair.label:
             continue
         candidates.append(pair)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda pair: pair.qty_col)
+    return sorted(candidates, key=lambda pair: pair.qty_col, reverse=True)
 
 
 def build_previous_estimate_cache(
@@ -1941,27 +1940,54 @@ def build_previous_estimate_cache(
     previous_values: dict[tuple[str, int, int], tuple[Optional[float], Optional[float]]] = {}
     for target in fill_targets:
         ws = sales_values_wb[target.sheet]
-        previous_pair = previous_estimate_pair(ws, target)
-        if previous_pair is None:
-            continue
+        historical_pairs = historical_quantity_amount_pairs(ws, target)
         for row in iter_sales_data_rows(ws):
-            previous_values[(target.sheet, target.qty_col, row)] = (
-                parse_number(ws.cell(row, previous_pair.qty_col).value),
-                parse_number(ws.cell(row, previous_pair.amt_col).value),
-            )
+            historical_value: tuple[Optional[float], Optional[float]] = (None, None)
+            for pair in historical_pairs:
+                historical_qty = parse_number(ws.cell(row, pair.qty_col).value)
+                historical_amount = parse_number(ws.cell(row, pair.amt_col).value)
+                if (
+                    historical_qty is None
+                    or historical_qty <= 0
+                    or historical_amount is None
+                ):
+                    continue
+                historical_value = (historical_qty, historical_amount)
+                break
+            previous_values[(target.sheet, target.qty_col, row)] = historical_value
     return previous_values
 
 
-def amount_from_previous_week(
+def amount_from_latest_history(
     qty: float,
-    previous_qty: Optional[float],
-    previous_amount: Optional[float],
+    historical_qty: Optional[float],
+    historical_amount: Optional[float],
 ) -> tuple[float, bool]:
-    if previous_qty == 0:
+    if historical_qty is None or historical_qty <= 0 or historical_amount is None:
         return 0.0, abs(float(qty)) > 1e-12
-    if previous_qty is None or previous_amount is None:
-        return 0.0, False
-    return round(qty * previous_amount / previous_qty, 4), False
+    return round(qty * historical_amount / historical_qty, 4), False
+
+
+def prediction_months_with_data(
+    predictions: dict[str, dict[int, float]],
+    unmatched_predictions: Iterable[dict],
+) -> set[int]:
+    """Identify only the months actually supplied in this upload."""
+    months = {
+        int(month)
+        for month_map in predictions.values()
+        for month in month_map
+        if 1 <= int(month) <= 12
+    }
+    for item in unmatched_predictions:
+        for month in (item.get("months") or {}):
+            try:
+                parsed_month = int(month)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= parsed_month <= 12:
+                months.add(parsed_month)
+    return months
 
 
 def cell_has_existing_nonzero_value(value) -> bool:
@@ -2030,12 +2056,14 @@ def forecast_pair_is_writable(
     overwrite_pairs: set[str],
     allow_legacy_overwrite: bool,
 ) -> bool:
+    # A non-empty pair may only be replaced when this exact coordinate was
+    # recorded as a previous website write. Styling is not proof of ownership:
+    # the source workbook may legitimately contain the same colors.
+    del allow_legacy_overwrite
     if cell_is_blank(qty_cell.value) and cell_is_blank(amt_cell.value):
         return True
     pair_key = forecast_pair_key(sheet, row, target.qty_col, target.amt_col)
-    if pair_key in overwrite_pairs:
-        return True
-    return allow_legacy_overwrite and pair_has_legacy_generated_style(qty_cell, amt_cell)
+    return pair_key in overwrite_pairs
 
 
 def filter_unmatched_prediction_months(
@@ -2213,6 +2241,7 @@ def process_sales_workbooks(
         as_of_date=as_of_date,
         unmatched_predictions=unmatched_predictions,
     )
+    uploaded_months = prediction_months_with_data(predictions, unmatched_predictions)
     report_progress(32, "匹配预测机种与销售排单客户机种")
     if not predictions:
         report_progress(90, "没有识别到可用预测，生成未改动文件")
@@ -2279,8 +2308,9 @@ def process_sales_workbooks(
     for target_index, target in enumerate(fill_targets, start=1):
         progress_percent = 45 + int((target_index - 1) / total_targets * 40)
         report_progress(progress_percent, "按预估空白栏回填数量和金额", target)
-        if not any(month_map.get(target.month) is not None for month_map in predictions.values()):
+        if target.month not in uploaded_months:
             skipped_months.append((target.sheet, target.label, target.month))
+            continue
 
         ws = sales_wb[target.sheet]
         vws = ws
@@ -2369,14 +2399,14 @@ def process_sales_workbooks(
             qty_cell.number_format = "0.0000"
             apply_forecast_cell_style(qty_cell, MATCHED_FORECAST_FONT_COLOR)
 
-            previous_qty, previous_amount = previous_estimate_values.get(
+            historical_qty, historical_amount = previous_estimate_values.get(
                 (target.sheet, target.qty_col, row),
                 (None, None),
             )
-            amount, invalid_previous_qty = amount_from_previous_week(
+            amount, invalid_previous_qty = amount_from_latest_history(
                 qty,
-                previous_qty,
-                previous_amount,
+                historical_qty,
+                historical_amount,
             )
             amt_cell.value = amount
             amt_cell.number_format = "0.00"
@@ -2465,7 +2495,9 @@ def process_sales_workbooks(
     )
     report_progress(96, "整理回填结果")
 
-    fill_target_months = sorted({target.month for target in fill_targets})
+    fill_target_months = sorted(
+        {target.month for target in fill_targets if target.month in uploaded_months}
+    )
     summary = {
         "output_path": output_path,
         "updated_rows": len(updates),
@@ -2515,7 +2547,7 @@ def process_sales_workbooks(
     print(f"completed deductions: {len(completed_deductions)}")
     for item in completed_deductions[:20]:
         print("completed_deduction", item)
-    print(f"invalid previous-week quantity amounts: {len(invalid_amount_rows)}")
+    print(f"amounts without valid historical unit price: {len(invalid_amount_rows)}")
     print(f"unmatched predictions with quantities: {len(summary['unmatched_predictions'])}")
 
     return summary
