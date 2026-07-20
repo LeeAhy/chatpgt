@@ -1479,7 +1479,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。若上周数量为 0，本周金额写 0 并使用深红色背景提示无法计算单价。</span>
+            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。若上周数量为 0，本周金额写 0 并使用浅红色背景提示无法计算单价。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -1519,7 +1519,7 @@ def render_page(
       </div>
       <div class="summary-item">
         <strong>金额异常提示</strong>
-        <span>上周数量为 0 时，本周金额写 0，并用深红色背景标记无法计算单价。</span>
+        <span>上周数量为 0 时，本周金额写 0，并用浅红色背景标记无法计算单价。</span>
       </div>
     </section>
   </main>

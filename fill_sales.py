@@ -55,7 +55,7 @@ MAX_FORMULA_RATIO = 0.2
 MIN_REASONABLE_PRICE = 0.01
 MAX_REASONABLE_PRICE = 1000.0
 NO_FORECAST_FILL = PatternFill(fill_type=None)
-INVALID_AMOUNT_FILL = PatternFill(fill_type="solid", fgColor="FF8B0000")
+INVALID_AMOUNT_FILL = PatternFill(fill_type="solid", fgColor="FFFFC7CE")
 # Use opaque ARGB values so Excel/WPS cannot interpret the font colors as
 # transparent or fall back to the workbook theme.
 MATCHED_FORECAST_FONT_COLOR = "FF008000"
