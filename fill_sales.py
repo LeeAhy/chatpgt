@@ -64,6 +64,13 @@ LEGACY_MATCHED_FORECAST_FILL_COLOR = "DDEBF7"
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 OCR_SOURCE_PATH = Path(__file__).with_name("ocr_image.m")
 OCR_BINARY_PATH = Path(tempfile.gettempdir()) / "sales_ocr_image"
+try:
+    SALES_SCAN_TIMEOUT_SECONDS = max(
+        180,
+        int(os.environ.get("SALES_SCAN_TIMEOUT_SECONDS", "600")),
+    )
+except (TypeError, ValueError):
+    SALES_SCAN_TIMEOUT_SECONDS = 600
 
 OWNER_PREDICTION_RULES = {
     "洪鸣": {"headers": ("New part NO",), "prefix": False, "unit": "wan"},
@@ -1664,10 +1671,15 @@ def create_trimmed_editing_copy(
         zipfile.ZipFile(output_path, "w") as output_archive,
     ):
         sheet_paths = workbook_sheet_xml_paths(source_archive)
-        missing = keep_names - set(sheet_paths)
+        normalized_sheet_paths = {
+            clean_text(name): path for name, path in sheet_paths.items()
+        }
+        missing = keep_names - set(normalized_sheet_paths)
         if missing:
             raise ValueError(f"无法定位待回填工作表：{'、'.join(sorted(missing))}")
-        keep_paths = {path for name, path in sheet_paths.items() if name in keep_names}
+        keep_paths = {
+            path for name, path in normalized_sheet_paths.items() if name in keep_names
+        }
         all_sheet_paths = set(sheet_paths.values())
         for item in source_archive.infolist():
             if item.filename in all_sheet_paths and item.filename not in keep_paths:
@@ -1919,18 +1931,26 @@ def unchanged_summary(
     }
 
 
-def historical_quantity_amount_pairs(ws, target: FillTarget) -> list[QuantityAmountPair]:
-    """Return earlier business quantity/amount pairs, newest first."""
-    candidates = []
+def historical_price_source_pairs(
+    ws,
+    target: FillTarget,
+) -> tuple[list[QuantityAmountPair], list[QuantityAmountPair]]:
+    """Return completed pairs first and estimate pairs second, newest first."""
+    completed_pairs = []
+    estimate_pairs = []
     for pair in find_quantity_amount_pairs(ws):
         if pair.qty_col >= target.qty_col:
             continue
-        # Difference columns are arithmetic results rather than a historical
-        # quantity/amount transaction and must never be used as a unit price.
-        if "差异" in pair.label:
-            continue
-        candidates.append(pair)
-    return sorted(candidates, key=lambda pair: pair.qty_col, reverse=True)
+        if "完成" in pair.label:
+            completed_pairs.append(pair)
+        elif "预估" in pair.label:
+            estimate_pairs.append(pair)
+    newest_first = lambda pairs: sorted(
+        pairs,
+        key=lambda pair: pair.qty_col,
+        reverse=True,
+    )
+    return newest_first(completed_pairs), newest_first(estimate_pairs)
 
 
 def build_previous_estimate_cache(
@@ -1940,20 +1960,44 @@ def build_previous_estimate_cache(
     previous_values: dict[tuple[str, int, int], tuple[Optional[float], Optional[float]]] = {}
     for target in fill_targets:
         ws = sales_values_wb[target.sheet]
-        historical_pairs = historical_quantity_amount_pairs(ws, target)
+        completed_pairs, estimate_pairs = historical_price_source_pairs(ws, target)
         for row in iter_sales_data_rows(ws):
             historical_value: tuple[Optional[float], Optional[float]] = (None, None)
-            for pair in historical_pairs:
+            has_completed_activity = False
+            for pair in completed_pairs:
                 historical_qty = parse_number(ws.cell(row, pair.qty_col).value)
                 historical_amount = parse_number(ws.cell(row, pair.amt_col).value)
+                if (
+                    historical_qty not in (None, 0)
+                    or historical_amount not in (None, 0)
+                ):
+                    has_completed_activity = True
                 if (
                     historical_qty is None
                     or historical_qty <= 0
                     or historical_amount is None
+                    or historical_amount <= 0
                 ):
                     continue
                 historical_value = (historical_qty, historical_amount)
                 break
+
+            # Estimates are a fallback only when the model has no historical
+            # completed activity at all. Invalid completed activity must be
+            # surfaced as a red amount instead of silently using an estimate.
+            if historical_value == (None, None) and not has_completed_activity:
+                for pair in estimate_pairs:
+                    historical_qty = parse_number(ws.cell(row, pair.qty_col).value)
+                    historical_amount = parse_number(ws.cell(row, pair.amt_col).value)
+                    if (
+                        historical_qty is None
+                        or historical_qty <= 0
+                        or historical_amount is None
+                        or historical_amount <= 0
+                    ):
+                        continue
+                    historical_value = (historical_qty, historical_amount)
+                    break
             previous_values[(target.sheet, target.qty_col, row)] = historical_value
     return previous_values
 
@@ -2086,12 +2130,62 @@ def filter_unmatched_prediction_months(
     return filtered
 
 
+def scan_sheet_names_for_current_and_future(
+    sales_path: Path,
+    current_month: int,
+) -> list[str]:
+    """Choose likely current/future sheets without loading the workbook."""
+    with zipfile.ZipFile(sales_path, "r") as archive:
+        sheet_names = list(workbook_sheet_xml_paths(archive))
+
+    year_by_sheet: dict[str, int] = {}
+    for sheet_name in sheet_names:
+        match = re.search(r"(?<!\d)(20\d{2}|\d{2})\s*年", sheet_name)
+        if match:
+            year_by_sheet[sheet_name] = int(match.group(1))
+    latest_year = max(year_by_sheet.values()) if year_by_sheet else None
+
+    selected = []
+    for sheet_name in sheet_names:
+        if latest_year is not None and year_by_sheet.get(sheet_name) != latest_year:
+            continue
+        month_text = sheet_name.split("年", 1)[1] if "年" in sheet_name else sheet_name
+        months = {
+            int(match.group(1))
+            for match in re.finditer(
+                r"(?<!\d)(1[0-2]|[1-9])(?=\s*(?:月|[-~—–至到]))",
+                month_text,
+            )
+        }
+        if months and max(months) >= current_month:
+            selected.append(sheet_name)
+
+    # Unknown naming conventions must remain safe: scan everything rather than
+    # accidentally hiding a valid forecast sheet.
+    return selected or sheet_names
+
+
 def build_sales_scan_payload(
     sales_path: Path,
     business_owner: Optional[str],
     current_month: int,
 ) -> dict:
-    sales_values_wb = load_workbook(sales_path, read_only=False, data_only=True)
+    sales_path = Path(sales_path)
+    scan_path = sales_path
+    trimmed_path: Optional[Path] = None
+    keep_sheet_names = scan_sheet_names_for_current_and_future(sales_path, current_month)
+    with zipfile.ZipFile(sales_path, "r") as archive:
+        all_sheet_names = list(workbook_sheet_xml_paths(archive))
+    if set(keep_sheet_names) != set(all_sheet_names):
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=sales_path.suffix or ".xlsx",
+        ) as temp_file:
+            trimmed_path = Path(temp_file.name)
+        create_trimmed_editing_copy(sales_path, trimmed_path, keep_sheet_names)
+        scan_path = trimmed_path
+
+    sales_values_wb = load_workbook(scan_path, read_only=False, data_only=True)
     try:
         fill_targets = select_relevant_fill_targets(
             find_fill_targets(sales_values_wb),
@@ -2124,6 +2218,8 @@ def build_sales_scan_payload(
         }
     finally:
         sales_values_wb.close()
+        if trimmed_path is not None:
+            trimmed_path.unlink(missing_ok=True)
 
 
 def scan_sales_inputs_in_subprocess(
@@ -2143,13 +2239,19 @@ def scan_sales_inputs_in_subprocess(
             str(current_month),
             str(payload_path),
         ]
-        completed = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=SALES_SCAN_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "读取共用销售排单超过允许时间。网站已停止本次任务以保护数据；"
+                f"当前上限为 {SALES_SCAN_TIMEOUT_SECONDS} 秒，请重新上传预测。"
+            ) from exc
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "未知错误").strip()[-1000:]
             raise RuntimeError(f"读取共用销售排单失败：{detail}")
