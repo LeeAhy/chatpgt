@@ -98,6 +98,8 @@ OWNER_STATUS_LABELS = {
 OWNER_STATUS_LIST_FIELDS = {
     "unmatched_predictions",
     "fill_target_months",
+    "skipped_target_months",
+    "monthly_fill_stats",
     "written_pairs",
 }
 
@@ -491,6 +493,8 @@ def default_owner_statuses() -> dict[str, dict]:
             "error": "",
             "unmatched_predictions": [],
             "fill_target_months": [],
+            "skipped_target_months": [],
+            "monthly_fill_stats": [],
             "matched_model_count": "",
             "written_pairs": [],
             "storage_warning": "",
@@ -526,6 +530,28 @@ def ensure_metadata_schema(metadata: dict) -> dict:
                     int(month)
                     for month in raw_months
                     if str(month).isdigit() and 1 <= int(month) <= 12
+                ]
+            raw_skipped_months = raw.get("skipped_target_months")
+            if isinstance(raw_skipped_months, list):
+                normalized[owner]["skipped_target_months"] = [
+                    int(month)
+                    for month in raw_skipped_months
+                    if str(month).isdigit() and 1 <= int(month) <= 12
+                ]
+            raw_monthly_stats = raw.get("monthly_fill_stats")
+            if isinstance(raw_monthly_stats, list):
+                normalized[owner]["monthly_fill_stats"] = [
+                    {
+                        "month": int(item.get("month")),
+                        "completed_rows": int(item.get("completed_rows", 0)),
+                        "total_rows": int(item.get("total_rows", 0)),
+                        "label": str(item.get("label") or ""),
+                        "skipped": bool(item.get("skipped", False)),
+                    }
+                    for item in raw_monthly_stats
+                    if isinstance(item, dict)
+                    and str(item.get("month", "")).isdigit()
+                    and 1 <= int(item.get("month")) <= 12
                 ]
             raw_written_pairs = raw.get("written_pairs")
             if isinstance(raw_written_pairs, list):
@@ -751,6 +777,22 @@ def render_page(
         owner_storage_warning = status.get("storage_warning") or ""
         unmatched_items = status.get("unmatched_predictions")
         unmatched_count = len(unmatched_items) if isinstance(unmatched_items, list) else 0
+        skipped_target_months = status.get("skipped_target_months")
+        if not isinstance(skipped_target_months, list):
+            skipped_target_months = []
+        skipped_month_text = "、".join(
+            f"{int(month)}月"
+            for month in skipped_target_months
+            if str(month).isdigit() and 1 <= int(month) <= 12
+        )
+        monthly_stats = status.get("monthly_fill_stats")
+        if not isinstance(monthly_stats, list):
+            monthly_stats = []
+        monthly_status_text = " ｜ ".join(
+            f'{int(item.get("month"))}月：{int(item.get("completed_rows", 0))}/{int(item.get("total_rows", 0))}行'
+            for item in monthly_stats
+            if isinstance(item, dict) and str(item.get("month", "")).isdigit()
+        )
         owner_status_card_items.append(
             f'<div class="owner-status {html.escape(state)}">'
             f'<strong>{html.escape(owner)}</strong>'
@@ -758,7 +800,9 @@ def render_page(
             f'<small>最近文件：{html.escape(prediction_name)}</small>'
             f'<small>上传时间：{html.escape(uploaded_at or "未上传")}</small>'
             f'<small>回填结果：{row_text}{("，" + html.escape(done_at)) if done_at else ""}</small>'
-            f'<small>未匹配：{unmatched_count} 项</small>'
+            f'<small>未回填/异常：{unmatched_count} 项</small>'
+            f'{f"<small>按月回填：{html.escape(monthly_status_text)}</small>" if monthly_status_text else ""}'
+            f'{f"<small>本次未识别月份：{html.escape(skipped_month_text)}</small>" if skipped_month_text else ""}'
             f'{f"<small>错误：{html.escape(error_text)}</small>" if error_text else ""}'
             f'{f"<small>备份提示：{html.escape(owner_storage_warning)}</small>" if owner_storage_warning else ""}'
             f'</div>'
@@ -774,9 +818,47 @@ def render_page(
     selected_target_months = sorted(
         {int(month) for month in selected_target_months if str(month).isdigit() and 1 <= int(month) <= 12}
     )
-    target_month_set = set(selected_target_months)
+    selected_skipped_months = selected_status.get("skipped_target_months")
+    if not isinstance(selected_skipped_months, list):
+        selected_skipped_months = []
+    selected_skipped_months = sorted(
+        {int(month) for month in selected_skipped_months if str(month).isdigit() and 1 <= int(month) <= 12}
+    )
+    skipped_month_notice_html = ""
+    if selected_skipped_months:
+        skipped_label = "、".join(f"{month}月" for month in selected_skipped_months)
+        skipped_month_notice_html = (
+            f'<p class="skipped-month-warning">本次预测未识别到 {html.escape(skipped_label)}，'
+            f'这些月份没有回填，请检查预测文件月份表头和数量。</p>'
+        )
+    selected_monthly_stats = selected_status.get("monthly_fill_stats")
+    if not isinstance(selected_monthly_stats, list):
+        selected_monthly_stats = []
+    monthly_fill_result_items = []
+    for item in sorted(
+        (item for item in selected_monthly_stats if isinstance(item, dict)),
+        key=lambda value: int(value.get("month", 99)),
+    ):
+        try:
+            month = int(item.get("month"))
+            completed_rows = int(item.get("completed_rows", 0))
+            total_rows = int(item.get("total_rows", 0))
+        except (TypeError, ValueError):
+            continue
+        monthly_fill_result_items.append(
+            f'<div class="month-total"><span>{month}月</span>'
+            f'<strong>{completed_rows}/{total_rows}行</strong></div>'
+        )
+    monthly_fill_results_html = ""
+    if monthly_fill_result_items:
+        monthly_fill_results_html = (
+            '<section class="monthly-fill-results" aria-label="按月回填结果">'
+            '<h3>按月回填结果</h3>'
+            f'<div class="month-totals">{"".join(monthly_fill_result_items)}</div>'
+            '</section>'
+        )
     unmatched_row_items = []
-    unmatched_month_totals: dict[int, float] = {month: 0.0 for month in selected_target_months}
+    unmatched_month_totals: dict[int, float] = {}
     for item in selected_unmatched:
         if not isinstance(item, dict):
             continue
@@ -791,8 +873,6 @@ def render_page(
                     return 99
 
             for month, qty in sorted(months.items(), key=month_sort_key):
-                if target_month_set and (not str(month).isdigit() or int(month) not in target_month_set):
-                    continue
                 try:
                     qty_number = float(qty)
                     qty_text = f"{qty_number:.4f}".rstrip("0").rstrip(".")
@@ -810,8 +890,9 @@ def render_page(
         if not month_parts:
             continue
         month_text = " ｜ ".join(month_parts)
+        reason = html.escape(str(item.get("reason") or "预测数据未回填"))
         unmatched_row_items.append(
-            f'<tr><td><strong>{model}</strong></td><td>{month_text}</td></tr>'
+            f'<tr><td><strong>{model}</strong></td><td>{month_text}</td><td>{reason}</td></tr>'
         )
     if unmatched_row_items:
         unmatched_body = "".join(unmatched_row_items)
@@ -823,24 +904,24 @@ def render_page(
             )
         unmatched_totals_html = "".join(unmatched_total_items)
         unmatched_panel_html = (
-            f'<section class="unmatched-panel" aria-label="未匹配预测列表">'
-            f'<div class="unmatched-head"><div><h3>未匹配预测列表</h3>'
-            f'<p>以下 {len(unmatched_row_items)} 个机种在预测文件中有数量，但没有匹配到共用销售排单，因此没有回填。</p></div>'
+            f'<section class="unmatched-panel" aria-label="未回填预测列表">'
+            f'<div class="unmatched-head"><div><h3>未回填预测列表</h3>'
+            f'<p>以下 {len(unmatched_row_items)} 项在预测文件中有非零数量，但未完整写入共用销售排单。</p>{skipped_month_notice_html}</div>'
             f'<span class="unmatched-count">{len(unmatched_row_items)} 项</span></div>'
-            f'<div class="month-totals" aria-label="未匹配预测各月合计">{unmatched_totals_html}</div>'
-            f'<div class="table-scroll"><table><thead><tr><th>预测文件机种</th><th>预测文件月份数量</th>'
+            f'<div class="month-totals" aria-label="未回填预测各月合计">{unmatched_totals_html}</div>'
+            f'<div class="table-scroll"><table><thead><tr><th>预测文件机种</th><th>预测文件月份数量</th><th>未回填原因</th>'
             f'</tr></thead><tbody>{unmatched_body}</tbody></table></div></section>'
         )
     elif selected_status.get("state") == "done":
         unmatched_panel_html = (
-            '<section class="unmatched-panel empty-list" aria-label="未匹配预测列表">'
-            '<div><h3>未匹配预测列表</h3><p>最近一次预测中，所有有数量的机种均已匹配。</p></div>'
+            '<section class="unmatched-panel empty-list" aria-label="未回填预测列表">'
+            f'<div><h3>未回填预测列表</h3><p>最近一次预测中，所有已识别的非零预测数据均已完整回填。</p>{skipped_month_notice_html}</div>'
             '<span class="unmatched-count ok">0 项</span></section>'
         )
     else:
         unmatched_panel_html = (
-            '<section class="unmatched-panel empty-list" aria-label="未匹配预测列表">'
-            '<div><h3>未匹配预测列表</h3><p>上传并处理预测后，这里会列出有数量但没有匹配成功的机种。</p></div>'
+            '<section class="unmatched-panel empty-list" aria-label="未回填预测列表">'
+            '<div><h3>未回填预测列表</h3><p>上传并处理预测后，这里会列出有非零数量但未完整回填的机种、月份和原因。</p></div>'
             '<span class="unmatched-count">待处理</span></section>'
         )
     job = get_job_status()
@@ -1299,6 +1380,17 @@ def render_page(
       border-radius: 10px;
       background: linear-gradient(145deg, rgba(245, 165, 36, 0.08), rgba(6, 18, 30, 0.94));
     }}
+    .monthly-fill-results {{
+      margin-top: 18px;
+      padding: 16px;
+      border: 1px solid rgba(22, 199, 186, 0.26);
+      border-radius: 10px;
+      background: rgba(6, 18, 30, 0.78);
+    }}
+    .monthly-fill-results h3 {{
+      margin: 0;
+      font-size: 17px;
+    }}
     .unmatched-head,
     .unmatched-panel.empty-list {{
       display: flex;
@@ -1315,6 +1407,11 @@ def render_page(
       color: var(--muted);
       font-size: 13px;
       line-height: 1.55;
+    }}
+    .unmatched-panel .skipped-month-warning {{
+      margin-top: 8px;
+      color: #ffd59a;
+      font-weight: 800;
     }}
     .unmatched-count {{
       display: inline-flex;
@@ -1479,7 +1576,7 @@ def render_page(
         <form method="post" action="/generate" enctype="multipart/form-data">
           <div class="rule-panel">
             {html.escape(selected_owner_guide)}
-            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。金额优先采用该机种最近有效的历史已完成单价；没有已完成数据时才采用历史预估单价，单价抓取失败则金额写 0 并使用浅红色背景提示。</span>
+            <span>系统以销售排单实际存在的预估栏月份为准；北京时间当月直接采用业务上传的剩余预估，不再扣减已完成数量。首次上传只写空白预估格；同一业务再次上传可覆盖其上一次由网站写入的预估数据，其他已有值和原始数据绝不覆盖。金额优先采用该机种最近有效的历史已完成单价；没有已完成数据时才采用历史预估单价，单价抓取失败则金额写 0 并使用深红色背景提示。</span>
           </div>
           <div>
             <label for="business_owner">业务担当</label>
@@ -1500,6 +1597,7 @@ def render_page(
             {preview_latest_html}
           </div>
         </form>
+        {monthly_fill_results_html}
         {unmatched_panel_html}
       </section>
     </section>
@@ -1519,7 +1617,7 @@ def render_page(
       </div>
       <div class="summary-item">
         <strong>金额异常提示</strong>
-        <span>金额优先采用最近有效的历史已完成单价；没有已完成数据时才采用历史预估单价。单价抓取失败时金额写 0，并用浅红色背景标记。</span>
+        <span>金额优先采用最近有效的历史已完成单价；没有已完成数据时才采用历史预估单价。单价抓取失败时金额写 0，并用深红色背景标记。</span>
       </div>
     </section>
   </main>
@@ -3608,6 +3706,8 @@ def process_prediction_job(
                     "error": "",
                     "unmatched_predictions": summary.get("unmatched_predictions", []),
                     "fill_target_months": summary.get("fill_target_months", []),
+                    "skipped_target_months": summary.get("skipped_target_months", []),
+                    "monthly_fill_stats": summary.get("monthly_fill_stats", []),
                     "matched_model_count": str(summary.get("matched_model_count", 0)),
                     "storage_warning": storage_warning,
                 }
@@ -3716,6 +3816,8 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             storage_warning="",
             unmatched_predictions=[],
             fill_target_months=[],
+            skipped_target_months=[],
+            monthly_fill_stats=[],
             matched_model_count="",
         )
         set_job_status(

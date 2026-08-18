@@ -55,7 +55,7 @@ MAX_FORMULA_RATIO = 0.2
 MIN_REASONABLE_PRICE = 0.01
 MAX_REASONABLE_PRICE = 1000.0
 NO_FORECAST_FILL = PatternFill(fill_type=None)
-INVALID_AMOUNT_FILL = PatternFill(fill_type="solid", fgColor="FFFFC7CE")
+INVALID_AMOUNT_FILL = PatternFill(fill_type="solid", fgColor="FFC00000")
 # Use opaque ARGB values so Excel/WPS cannot interpret the font colors as
 # transparent or fall back to the workbook theme.
 MATCHED_FORECAST_FONT_COLOR = "FF008000"
@@ -848,16 +848,18 @@ def dedupe_unmatched_predictions(entries: Iterable[dict]) -> list[dict]:
         model = clean_text(entry.get("model"))
         if not model:
             continue
-        key = normalize_code(model) or compact_text(model)
-        if not key:
+        model_key = normalize_code(model) or compact_text(model)
+        if not model_key:
             continue
+        reason = clean_text(entry.get("reason")) or "预测机种未在共用排单中找到"
+        key = f"{model_key}|{reason}"
         current = merged.setdefault(
             key,
             {
                 "model": model,
                 "months": {},
                 "sources": [],
-                "reason": clean_text(entry.get("reason")) or "预测机种未在共用排单中找到",
+                "reason": reason,
             },
         )
         for month, qty in (entry.get("months") or {}).items():
@@ -1924,6 +1926,8 @@ def unchanged_summary(
         "warnings": [warning],
         "unmatched_predictions": dedupe_unmatched_predictions(unmatched_predictions or []),
         "fill_target_months": [],
+        "skipped_target_months": [],
+        "monthly_fill_stats": [],
         "matched_model_count": 0,
         "matched_customer_models": [],
         "written_pairs": [],
@@ -2359,6 +2363,19 @@ def process_sales_workbooks(
             source_path=sales_path,
         )
 
+    available_target_months = {target.month for target in fill_targets}
+    for code, month_map in predictions.items():
+        for month, qty in month_map.items():
+            if month in available_target_months or abs(float(qty)) <= 1e-12:
+                continue
+            append_unmatched_prediction(
+                unmatched_predictions,
+                code,
+                {month: qty},
+                source=pred_path.name,
+                reason="销售排单没有该月份的可回填预估栏",
+            )
+
     report_progress(40, f"识别销售排单预估空白栏：{len(fill_targets)} 个")
     report_progress(45, "打开可编辑销售排单")
     if not fill_targets:
@@ -2371,6 +2388,7 @@ def process_sales_workbooks(
             business_owner,
             as_of_date,
             "销售排单里没有找到空白的数量/金额栏，已生成未改动文件。",
+            unmatched_predictions=unmatched_predictions,
             source_path=sales_path,
         )
 
@@ -2403,6 +2421,7 @@ def process_sales_workbooks(
     zero_filled_rows = []
     written_pairs: set[str] = set()
     invalid_amount_rows = []
+    monthly_fill_stats_by_month: dict[int, dict] = {}
     matched_customer_models: set[str] = set()
     warnings = []
 
@@ -2410,10 +2429,6 @@ def process_sales_workbooks(
     for target_index, target in enumerate(fill_targets, start=1):
         progress_percent = 45 + int((target_index - 1) / total_targets * 40)
         report_progress(progress_percent, "按预估空白栏回填数量和金额", target)
-        if target.month not in uploaded_months:
-            skipped_months.append((target.sheet, target.label, target.month))
-            continue
-
         ws = sales_wb[target.sheet]
         vws = ws
         source_columns = find_header_columns(vws)
@@ -2454,6 +2469,23 @@ def process_sales_workbooks(
                 if norm_code:
                     normalized_code_to_code[norm_code] = code
 
+        if target.month not in uploaded_months:
+            skipped_months.append((target.sheet, target.label, target.month))
+            completed_rows = sum(
+                1
+                for row in eligible_rows
+                if not cell_is_blank(ws.cell(row, target.qty_col).value)
+                and not cell_is_blank(ws.cell(row, target.amt_col).value)
+            )
+            monthly_fill_stats_by_month[target.month] = {
+                "month": target.month,
+                "completed_rows": completed_rows,
+                "total_rows": len(eligible_rows),
+                "label": target.label,
+                "skipped": True,
+            }
+            continue
+
         matched_prediction_rows: set[int] = set()
         for code, month_map in predictions.items():
             qty = month_map.get(target.month)
@@ -2469,6 +2501,13 @@ def process_sales_workbooks(
                     row = code_to_row.get(matched_code)
             if row is None:
                 missing_rows.append((target.sheet, target.label, code, business_owner or "全部"))
+                append_unmatched_prediction(
+                    unmatched_predictions,
+                    code,
+                    {target.month: qty},
+                    source=pred_path.name,
+                    reason="该月份销售排单中未找到对应客户机种行",
+                )
                 continue
 
             matched_prediction_rows.add(row)
@@ -2494,6 +2533,13 @@ def process_sales_workbooks(
                         qty_cell.value,
                         amt_cell.value,
                     )
+                )
+                append_unmatched_prediction(
+                    unmatched_predictions,
+                    code,
+                    {target.month: qty},
+                    source=pred_path.name,
+                    reason="对应预估栏已有原始数据，按保护规则未覆盖",
                 )
                 continue
 
@@ -2523,6 +2569,13 @@ def process_sales_workbooks(
                         target.label,
                         get_column_letter(target.amt_col),
                     )
+                )
+                append_unmatched_prediction(
+                    unmatched_predictions,
+                    code,
+                    {target.month: qty},
+                    source=pred_path.name,
+                    reason="数量已回填，但未取得有效历史单价，金额写 0 并标红",
                 )
             written_pairs.add(
                 forecast_pair_key(target.sheet, row, target.qty_col, target.amt_col)
@@ -2576,6 +2629,20 @@ def process_sales_workbooks(
                 )
             )
 
+        completed_rows = sum(
+            1
+            for row in eligible_rows
+            if not cell_is_blank(ws.cell(row, target.qty_col).value)
+            and not cell_is_blank(ws.cell(row, target.amt_col).value)
+        )
+        monthly_fill_stats_by_month[target.month] = {
+            "month": target.month,
+            "completed_rows": completed_rows,
+            "total_rows": len(eligible_rows),
+            "label": target.label,
+            "skipped": False,
+        }
+
     if not updates and not zero_filled_rows:
         warnings.append("没有找到可回填的匹配行，已生成未改动文件。")
     elif not updates:
@@ -2600,6 +2667,9 @@ def process_sales_workbooks(
     fill_target_months = sorted(
         {target.month for target in fill_targets if target.month in uploaded_months}
     )
+    skipped_target_months = sorted(
+        {target.month for target in fill_targets if target.month not in uploaded_months}
+    )
     summary = {
         "output_path": output_path,
         "updated_rows": len(updates),
@@ -2615,9 +2685,14 @@ def process_sales_workbooks(
         "warnings": warnings,
         "unmatched_predictions": filter_unmatched_prediction_months(
             unmatched_predictions,
-            fill_target_months,
+            {month for month in uploaded_months if month >= as_of_date.month},
         ),
         "fill_target_months": fill_target_months,
+        "skipped_target_months": skipped_target_months,
+        "monthly_fill_stats": [
+            monthly_fill_stats_by_month[month]
+            for month in sorted(monthly_fill_stats_by_month)
+        ],
         "matched_model_count": len(matched_customer_models),
         "matched_customer_models": sorted(matched_customer_models, key=normalize_code),
         "written_pairs": sorted(written_pairs),
