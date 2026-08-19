@@ -298,7 +298,8 @@ def extract_fill_target_month(sheet_name: str, label: str) -> Optional[int]:
     return extract_sheet_month(sheet_name)
 
 
-def header_scan_max_col(ws, limit: int = 240) -> int:
+def header_scan_max_col(ws, limit: int = 1000) -> int:
+    """Return the last valued header column without trusting formatted max_column."""
     max_col = 0
     cells = getattr(ws, "_cells", None)
     if cells:
