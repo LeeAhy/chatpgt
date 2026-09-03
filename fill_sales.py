@@ -141,6 +141,7 @@ class FillTarget:
     amt_col: int
     owner_col: int
     code_col: int
+    year: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -290,12 +291,41 @@ def extract_sheet_month(sheet_name: str) -> Optional[int]:
     return int(match.group(1))
 
 
+def normalize_year_number(value: int) -> int:
+    return 2000 + value if value < 100 else value
+
+
+def extract_year_number(value) -> Optional[int]:
+    text = clean_text(value)
+    match = re.search(r"(?<!\d)(20\d{2}|\d{2})\s*年", text)
+    if not match:
+        return None
+    return normalize_year_number(int(match.group(1)))
+
+
 def extract_fill_target_month(sheet_name: str, label: str) -> Optional[int]:
     label_text = clean_text(label)
     match = re.search(r"[（(]\s*([1-9]|1[0-2])\s*月\s*[）)]", label_text)
     if match:
         return int(match.group(1))
     return extract_sheet_month(sheet_name)
+
+
+def extract_fill_target_year(sheet_name: str, label: str) -> Optional[int]:
+    return extract_year_number(label) or extract_year_number(sheet_name)
+
+
+def fill_target_period(
+    target: FillTarget,
+    current_year: int,
+    current_month: int,
+) -> tuple[int, int]:
+    # Older schedules often omit the year from the forecast label. In that
+    # case, a month lower than the current month belongs to the next year.
+    year = target.year
+    if year is None:
+        year = current_year + (1 if target.month < current_month else 0)
+    return year, target.month
 
 
 def header_scan_max_col(ws, limit: int = 1000) -> int:
@@ -434,6 +464,7 @@ def find_fill_targets(sales_wb) -> list[FillTarget]:
                     amt_col=pair.amt_col,
                     owner_col=columns.owner_col,
                     code_col=columns.code_col,
+                    year=extract_fill_target_year(sheet_name, pair.label),
                 )
             )
 
@@ -441,9 +472,9 @@ def find_fill_targets(sales_wb) -> list[FillTarget]:
 
 
 def select_latest_fill_targets(targets: Iterable[FillTarget]) -> list[FillTarget]:
-    latest_by_sheet_month: dict[tuple[str, int], FillTarget] = {}
+    latest_by_sheet_month: dict[tuple[str, Optional[int], int], FillTarget] = {}
     for target in targets:
-        key = (target.sheet, target.month)
+        key = (target.sheet, target.year, target.month)
         current = latest_by_sheet_month.get(key)
         if current is None or target.qty_col > current.qty_col:
             latest_by_sheet_month[key] = target
@@ -453,26 +484,38 @@ def select_latest_fill_targets(targets: Iterable[FillTarget]) -> list[FillTarget
 def select_relevant_fill_targets(
     targets: Iterable[FillTarget],
     current_month: int,
+    current_year: Optional[int] = None,
 ) -> list[FillTarget]:
-    """Prefer the current multi-month planning sheet over archived month sheets."""
+    """Choose the active planning sheet independently for every future year."""
+    current_year = current_year or datetime.now(BEIJING_TZ).year
     latest = [
         target
         for target in select_latest_fill_targets(targets)
-        if target.month >= current_month
+        if fill_target_period(target, current_year, current_month)
+        >= (current_year, current_month)
     ]
-    months_by_sheet: dict[str, set[int]] = defaultdict(set)
+    targets_by_year: dict[int, list[FillTarget]] = defaultdict(list)
     for target in latest:
-        months_by_sheet[target.sheet].add(target.month)
-    if not months_by_sheet:
-        return []
+        target_year, _ = fill_target_period(target, current_year, current_month)
+        targets_by_year[target_year].append(target)
 
-    best_sheet, best_months = max(
-        months_by_sheet.items(),
-        key=lambda item: (len(item[1]), max(item[1]), item[0]),
-    )
-    if len(best_months) <= 1:
-        return latest
-    return [target for target in latest if target.sheet == best_sheet]
+    selected: list[FillTarget] = []
+    for target_year in sorted(targets_by_year):
+        year_targets = targets_by_year[target_year]
+        months_by_sheet: dict[str, set[tuple[int, int]]] = defaultdict(set)
+        for target in year_targets:
+            months_by_sheet[target.sheet].add(
+                fill_target_period(target, current_year, current_month)
+            )
+        best_sheet, best_months = max(
+            months_by_sheet.items(),
+            key=lambda item: (len(item[1]), max(item[1]), item[0]),
+        )
+        if len(best_months) <= 1:
+            selected.extend(year_targets)
+        else:
+            selected.extend(target for target in year_targets if target.sheet == best_sheet)
+    return selected
 
 
 def is_zero_placeholder(value) -> bool:
@@ -2138,22 +2181,21 @@ def filter_unmatched_prediction_months(
 def scan_sheet_names_for_current_and_future(
     sales_path: Path,
     current_month: int,
+    current_year: Optional[int] = None,
 ) -> list[str]:
     """Choose likely current/future sheets without loading the workbook."""
+    current_year = current_year or datetime.now(BEIJING_TZ).year
     with zipfile.ZipFile(sales_path, "r") as archive:
         sheet_names = list(workbook_sheet_xml_paths(archive))
 
     year_by_sheet: dict[str, int] = {}
     for sheet_name in sheet_names:
-        match = re.search(r"(?<!\d)(20\d{2}|\d{2})\s*年", sheet_name)
-        if match:
-            year_by_sheet[sheet_name] = int(match.group(1))
-    latest_year = max(year_by_sheet.values()) if year_by_sheet else None
-
-    selected = []
+        year = extract_year_number(sheet_name)
+        if year is not None:
+            year_by_sheet[sheet_name] = year
+    dated_selected = []
+    undated_selected = []
     for sheet_name in sheet_names:
-        if latest_year is not None and year_by_sheet.get(sheet_name) != latest_year:
-            continue
         month_text = sheet_name.split("年", 1)[1] if "年" in sheet_name else sheet_name
         months = {
             int(match.group(1))
@@ -2162,23 +2204,35 @@ def scan_sheet_names_for_current_and_future(
                 month_text,
             )
         }
-        if months and max(months) >= current_month:
-            selected.append(sheet_name)
+        sheet_year = year_by_sheet.get(sheet_name)
+        if months and (
+            sheet_year is not None
+            and (sheet_year, max(months)) >= (current_year, current_month)
+        ):
+            dated_selected.append(sheet_name)
+        elif months and sheet_year is None and max(months) >= current_month:
+            undated_selected.append(sheet_name)
 
     # Unknown naming conventions must remain safe: scan everything rather than
     # accidentally hiding a valid forecast sheet.
-    return selected or sheet_names
+    return dated_selected or undated_selected or sheet_names
 
 
 def build_sales_scan_payload(
     sales_path: Path,
     business_owner: Optional[str],
     current_month: int,
+    current_year: Optional[int] = None,
 ) -> dict:
     sales_path = Path(sales_path)
+    current_year = current_year or datetime.now(BEIJING_TZ).year
     scan_path = sales_path
     trimmed_path: Optional[Path] = None
-    keep_sheet_names = scan_sheet_names_for_current_and_future(sales_path, current_month)
+    keep_sheet_names = scan_sheet_names_for_current_and_future(
+        sales_path,
+        current_month,
+        current_year,
+    )
     with zipfile.ZipFile(sales_path, "r") as archive:
         all_sheet_names = list(workbook_sheet_xml_paths(archive))
     if set(keep_sheet_names) != set(all_sheet_names):
@@ -2195,6 +2249,7 @@ def build_sales_scan_payload(
         fill_targets = select_relevant_fill_targets(
             find_fill_targets(sales_values_wb),
             current_month,
+            current_year,
         )
         sales_codes = collect_sales_codes(
             sales_values_wb,
@@ -2213,6 +2268,7 @@ def build_sales_scan_payload(
                     "amt_col": target.amt_col,
                     "owner_col": target.owner_col,
                     "code_col": target.code_col,
+                    "year": target.year,
                 }
                 for target in fill_targets
             ],
@@ -2231,7 +2287,9 @@ def scan_sales_inputs_in_subprocess(
     sales_path: Path,
     business_owner: Optional[str],
     current_month: int,
+    current_year: Optional[int] = None,
 ) -> tuple[set[str], list[FillTarget], dict[tuple[str, int, int], tuple[Optional[float], Optional[float]]]]:
+    current_year = current_year or datetime.now(BEIJING_TZ).year
     with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as temp_file:
         payload_path = Path(temp_file.name)
     try:
@@ -2242,6 +2300,7 @@ def scan_sales_inputs_in_subprocess(
             str(sales_path),
             business_owner or "",
             str(current_month),
+            str(current_year),
             str(payload_path),
         ]
         try:
@@ -2323,6 +2382,7 @@ def process_sales_workbooks(
         sales_path,
         business_owner,
         as_of_date.month,
+        as_of_date.year,
     )
     report_progress(12, "读取销售排单客户机种")
     if not sales_codes:
@@ -2686,7 +2746,7 @@ def process_sales_workbooks(
         "warnings": warnings,
         "unmatched_predictions": filter_unmatched_prediction_months(
             unmatched_predictions,
-            {month for month in uploaded_months if month >= as_of_date.month},
+            uploaded_months,
         ),
         "fill_target_months": fill_target_months,
         "skipped_target_months": skipped_target_months,
@@ -2732,13 +2792,15 @@ def process_sales_workbooks(
 
 
 def main():
-    if len(sys.argv) == 6 and sys.argv[1] == "--scan-sales":
+    if len(sys.argv) in (6, 7) and sys.argv[1] == "--scan-sales":
+        has_year = len(sys.argv) == 7
         payload = build_sales_scan_payload(
             Path(sys.argv[2]),
             sys.argv[3] or None,
             int(sys.argv[4]),
+            int(sys.argv[5]) if has_year else None,
         )
-        Path(sys.argv[5]).write_text(
+        Path(sys.argv[6] if has_year else sys.argv[5]).write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
