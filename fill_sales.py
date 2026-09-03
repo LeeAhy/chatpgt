@@ -305,7 +305,10 @@ def extract_year_number(value) -> Optional[int]:
 
 def extract_fill_target_month(sheet_name: str, label: str) -> Optional[int]:
     label_text = clean_text(label)
-    match = re.search(r"[（(]\s*([1-9]|1[0-2])\s*月\s*[）)]", label_text)
+    match = re.search(
+        r"[（(]\s*(?:(?:20)?\d{2}\s*年\s*)?([1-9]|1[0-2])\s*月\s*[）)]",
+        label_text,
+    )
     if match:
         return int(match.group(1))
     return extract_sheet_month(sheet_name)
