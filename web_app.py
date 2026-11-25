@@ -69,6 +69,7 @@ LOGIN_COOKIE_NAME = "sales_upload_session"
 LOGIN_SESSION_SECONDS = 12 * 60 * 60
 STATE_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
+HYDRATE_LOCK = threading.Lock()
 JOB_STATUS = {
     "state": "idle",
     "owner": "",
@@ -403,40 +404,48 @@ def remote_get_file(key: str, path: Path) -> bool:
         return False
 
     ensure_data_dir()
-    temp_path = path.with_name(f".{path.name}.download")
+    # Multiple browser GET/HEAD requests can hydrate the same workbook at the
+    # same time after a free Render instance wakes up. A unique temporary file
+    # prevents one request from replacing or deleting another request's file.
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".download",
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
     expected_size: Optional[int] = None
-    manifest_data = remote_request("GET", f"manifests/{key}.json")
-    if manifest_data is not None:
-        manifest = json.loads(manifest_data.decode("utf-8"))
-        chunk_keys = manifest.get("chunks") or []
-        if not chunk_keys:
+    try:
+        manifest_data = remote_request("GET", f"manifests/{key}.json")
+        if manifest_data is not None:
+            manifest = json.loads(manifest_data.decode("utf-8"))
+            chunk_keys = manifest.get("chunks") or []
+            if not chunk_keys:
+                return False
+            expected_size = int(manifest.get("size") or 0) or None
+            with temp_path.open("wb") as out:
+                for chunk_key in chunk_keys:
+                    chunk = remote_request("GET", str(chunk_key))
+                    if chunk is None:
+                        return False
+                    out.write(chunk)
+            if expected_size is not None and temp_path.stat().st_size != expected_size:
+                raise RuntimeError("Netlify Blobs 里的 Excel 分片不完整，请重新上传共用销售排单。")
+            if key.lower().endswith((".xlsx", ".xlsm")) and not zipfile.is_zipfile(temp_path):
+                raise RuntimeError("Netlify Blobs 里的 Excel 文件不完整，请重新上传共用销售排单。")
+            temp_path.replace(path)
+            return True
+
+        data = remote_request("GET", key)
+        if data is None:
             return False
-        expected_size = int(manifest.get("size") or 0) or None
-        with temp_path.open("wb") as out:
-            for chunk_key in chunk_keys:
-                chunk = remote_request("GET", str(chunk_key))
-                if chunk is None:
-                    temp_path.unlink(missing_ok=True)
-                    return False
-                out.write(chunk)
-        if expected_size is not None and temp_path.stat().st_size != expected_size:
-            temp_path.unlink(missing_ok=True)
-            raise RuntimeError("Netlify Blobs 里的 Excel 分片不完整，请重新上传共用销售排单。")
+        temp_path.write_bytes(data)
         if key.lower().endswith((".xlsx", ".xlsm")) and not zipfile.is_zipfile(temp_path):
-            temp_path.unlink(missing_ok=True)
             raise RuntimeError("Netlify Blobs 里的 Excel 文件不完整，请重新上传共用销售排单。")
         temp_path.replace(path)
         return True
-
-    data = remote_request("GET", key)
-    if data is None:
-        return False
-    temp_path.write_bytes(data)
-    if key.lower().endswith((".xlsx", ".xlsm")) and not zipfile.is_zipfile(temp_path):
+    finally:
         temp_path.unlink(missing_ok=True)
-        raise RuntimeError("Netlify Blobs 里的 Excel 文件不完整，请重新上传共用销售排单。")
-    temp_path.replace(path)
-    return True
 
 
 def remote_put_json(key: str, payload: dict) -> None:
@@ -453,13 +462,16 @@ def remote_put_json(key: str, payload: dict) -> None:
 def hydrate_remote_state() -> None:
     if not remote_storage_enabled():
         return
-    ensure_data_dir()
-    if not METADATA_PATH.exists():
-        remote_get_file(REMOTE_METADATA_KEY, METADATA_PATH)
-    if not MASTER_SALES_PATH.exists():
-        remote_get_file(REMOTE_MASTER_KEY, MASTER_SALES_PATH)
-    if MASTER_SALES_PATH.exists() and not LATEST_OUTPUT_PATH.exists():
-        shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
+    # A cold instance receives several page and status requests together.
+    # Hydrate once; waiting requests re-check the files after acquiring the lock.
+    with HYDRATE_LOCK:
+        ensure_data_dir()
+        if not METADATA_PATH.exists():
+            remote_get_file(REMOTE_METADATA_KEY, METADATA_PATH)
+        if not MASTER_SALES_PATH.exists():
+            remote_get_file(REMOTE_MASTER_KEY, MASTER_SALES_PATH)
+        if MASTER_SALES_PATH.exists() and not LATEST_OUTPUT_PATH.exists():
+            shutil.copy2(MASTER_SALES_PATH, LATEST_OUTPUT_PATH)
 
 
 def sync_master_files_to_remote() -> None:
