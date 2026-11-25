@@ -409,6 +409,89 @@ def find_quantity_amount_pairs(ws) -> list[QuantityAmountPair]:
     return pairs
 
 
+def header_value(header_rows: list[tuple], row: int, col: int):
+    if row < 1 or row > len(header_rows) or col < 1:
+        return None
+    values = header_rows[row - 1]
+    return values[col - 1] if col <= len(values) else None
+
+
+def find_header_columns_from_rows(header_rows: list[tuple]) -> HeaderColumns:
+    """Find schedule identity columns from a small streamed header."""
+    owner_col = None
+    code_col = None
+    erp_code_col = None
+    price_col = None
+    fx_col = None
+    max_col = min(max((len(row) for row in header_rows), default=0), 80)
+
+    for row in header_rows:
+        for col in range(1, max_col + 1):
+            text = clean_text(row[col - 1] if col <= len(row) else None)
+            if not text:
+                continue
+            if owner_col is None and "业务担当" in text:
+                owner_col = col
+            if code_col is None and "客户机种" in text:
+                code_col = col
+            if erp_code_col is None and ("ERP料号" in text or "T100料号" in text):
+                erp_code_col = col
+            if price_col is None and "单价" in text:
+                price_col = col
+            if fx_col is None and "汇率" in text:
+                fx_col = col
+
+    return HeaderColumns(
+        owner_col=owner_col or 5,
+        code_col=code_col or 14,
+        erp_code_col=erp_code_col,
+        price_col=price_col,
+        fx_col=fx_col,
+    )
+
+
+def find_code_columns_from_rows(
+    header_rows: list[tuple],
+    columns: HeaderColumns,
+) -> list[int]:
+    code_cols = []
+    for col in (columns.code_col, columns.erp_code_col):
+        if col and col not in code_cols:
+            code_cols.append(col)
+
+    max_col = min(max((len(row) for row in header_rows), default=0), 200)
+    for row in header_rows:
+        for col in range(1, max_col + 1):
+            text = clean_text(row[col - 1] if col <= len(row) else None)
+            if ("ERP料号" in text or "T100料号" in text) and col not in code_cols:
+                code_cols.append(col)
+    return code_cols
+
+
+def find_quantity_amount_pairs_from_rows(
+    header_rows: list[tuple],
+) -> list[QuantityAmountPair]:
+    pairs: list[QuantityAmountPair] = []
+    max_col = min(max((len(row) for row in header_rows), default=0), 1000)
+    for col in range(1, max_col):
+        qty_label = clean_text(header_value(header_rows, 4, col))
+        amt_label = clean_text(header_value(header_rows, 4, col + 1))
+        if "数量" not in qty_label or "金额" not in amt_label:
+            continue
+        pairs.append(
+            QuantityAmountPair(
+                qty_col=col,
+                amt_col=col + 1,
+                label=clean_text(header_value(header_rows, 3, col)),
+            )
+        )
+    return pairs
+
+
+def row_value(values: tuple, col: int):
+    return values[col - 1] if col > 0 and col <= len(values) else None
+
+
 def is_fillable_pair(ws, pair: QuantityAmountPair) -> bool:
     if any(word in pair.label for word in NO_FILL_LABEL_WORDS):
         return False
@@ -2229,61 +2312,183 @@ def build_sales_scan_payload(
 ) -> dict:
     sales_path = Path(sales_path)
     current_year = current_year or datetime.now(BEIJING_TZ).year
-    scan_path = sales_path
-    trimmed_path: Optional[Path] = None
     keep_sheet_names = scan_sheet_names_for_current_and_future(
         sales_path,
         current_month,
         current_year,
     )
-    with zipfile.ZipFile(sales_path, "r") as archive:
-        all_sheet_names = list(workbook_sheet_xml_paths(archive))
-    if set(keep_sheet_names) != set(all_sheet_names):
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=sales_path.suffix or ".xlsx",
-        ) as temp_file:
-            trimmed_path = Path(temp_file.name)
-        create_trimmed_editing_copy(sales_path, trimmed_path, keep_sheet_names)
-        scan_path = trimmed_path
 
-    sales_values_wb = load_workbook(scan_path, read_only=False, data_only=True)
+    # A normal openpyxl load expands all cells and styles, which can exceed
+    # Render's 512 MB limit for the wide shared schedule. Read headers first,
+    # then stream only the columns needed for matching and historical prices.
+    header_rows_by_sheet: dict[str, list[tuple]] = {}
+    columns_by_sheet: dict[str, HeaderColumns] = {}
+    pairs_by_sheet: dict[str, list[QuantityAmountPair]] = {}
+    candidate_targets: list[FillTarget] = []
+    header_wb = load_workbook(sales_path, read_only=True, data_only=True)
     try:
-        fill_targets = select_relevant_fill_targets(
-            find_fill_targets(sales_values_wb),
-            current_month,
-            current_year,
-        )
-        sales_codes = collect_sales_codes(
-            sales_values_wb,
-            business_owner=business_owner,
-            sheet_names={target.sheet for target in fill_targets},
-        )
-        previous_values = build_previous_estimate_cache(sales_values_wb, fill_targets)
-        return {
-            "sales_codes": sorted(sales_codes, key=normalize_code),
-            "fill_targets": [
-                {
-                    "sheet": target.sheet,
-                    "month": target.month,
-                    "label": target.label,
-                    "qty_col": target.qty_col,
-                    "amt_col": target.amt_col,
-                    "owner_col": target.owner_col,
-                    "code_col": target.code_col,
-                    "year": target.year,
-                }
-                for target in fill_targets
-            ],
-            "previous_estimate_values": [
-                [sheet, qty_col, row, previous_qty, previous_amount]
-                for (sheet, qty_col, row), (previous_qty, previous_amount) in previous_values.items()
-            ],
-        }
+        for sheet_name in keep_sheet_names:
+            if sheet_name not in header_wb.sheetnames:
+                continue
+            ws = header_wb[sheet_name]
+            header_rows = list(
+                ws.iter_rows(
+                    min_row=1,
+                    max_row=HEADER_SCAN_ROWS,
+                    max_col=1000,
+                    values_only=True,
+                )
+            )
+            columns = find_header_columns_from_rows(header_rows)
+            pairs = find_quantity_amount_pairs_from_rows(header_rows)
+            header_rows_by_sheet[sheet_name] = header_rows
+            columns_by_sheet[sheet_name] = columns
+            pairs_by_sheet[sheet_name] = pairs
+            for pair in pairs:
+                if "预估" not in pair.label:
+                    continue
+                if any(word in pair.label for word in NO_FILL_LABEL_WORDS):
+                    continue
+                month = extract_fill_target_month(sheet_name, pair.label)
+                if month is None:
+                    continue
+                candidate_targets.append(
+                    FillTarget(
+                        sheet=sheet_name,
+                        month=month,
+                        label=pair.label,
+                        qty_col=pair.qty_col,
+                        amt_col=pair.amt_col,
+                        owner_col=columns.owner_col,
+                        code_col=columns.code_col,
+                        year=extract_fill_target_year(sheet_name, pair.label),
+                    )
+                )
     finally:
-        sales_values_wb.close()
-        if trimmed_path is not None:
-            trimmed_path.unlink(missing_ok=True)
+        header_wb.close()
+
+    fill_targets = select_relevant_fill_targets(
+        candidate_targets,
+        current_month,
+        current_year,
+    )
+    targets_by_sheet: dict[str, list[FillTarget]] = defaultdict(list)
+    for target in fill_targets:
+        targets_by_sheet[target.sheet].append(target)
+
+    sales_codes: set[str] = set()
+    previous_values: dict[
+        tuple[str, int, int],
+        tuple[Optional[float], Optional[float]],
+    ] = {}
+    values_wb = load_workbook(sales_path, read_only=True, data_only=True)
+    try:
+        for sheet_name, sheet_targets in targets_by_sheet.items():
+            if sheet_name not in values_wb.sheetnames:
+                continue
+            ws = values_wb[sheet_name]
+            header_rows = header_rows_by_sheet[sheet_name]
+            columns = columns_by_sheet[sheet_name]
+            code_columns = find_code_columns_from_rows(header_rows, columns)
+            pairs = pairs_by_sheet[sheet_name]
+            history_by_target = {}
+            for target in sheet_targets:
+                earlier_pairs = [pair for pair in pairs if pair.qty_col < target.qty_col]
+                history_by_target[target.qty_col] = (
+                    sorted(
+                        (pair for pair in earlier_pairs if "完成" in pair.label),
+                        key=lambda pair: pair.qty_col,
+                        reverse=True,
+                    ),
+                    sorted(
+                        (pair for pair in earlier_pairs if "预估" in pair.label),
+                        key=lambda pair: pair.qty_col,
+                        reverse=True,
+                    ),
+                )
+
+            needed_cols = [columns.owner_col, *code_columns]
+            for target in sheet_targets:
+                needed_cols.extend((target.qty_col, target.amt_col))
+                completed_pairs, estimate_pairs = history_by_target[target.qty_col]
+                for pair in (*completed_pairs, *estimate_pairs):
+                    needed_cols.extend((pair.qty_col, pair.amt_col))
+            max_needed_col = max(needed_cols, default=1)
+
+            for row_number, values in enumerate(
+                ws.iter_rows(
+                    min_row=DATA_START_ROW,
+                    max_row=ws.max_row,
+                    max_col=max_needed_col,
+                    values_only=True,
+                ),
+                start=DATA_START_ROW,
+            ):
+                owner = clean_text(row_value(values, columns.owner_col))
+                if business_owner and not owner_matches(business_owner, owner):
+                    continue
+
+                for code_col in code_columns:
+                    code = clean_text(row_value(values, code_col))
+                    if code:
+                        sales_codes.add(code)
+
+                for target in sheet_targets:
+                    completed_pairs, estimate_pairs = history_by_target[target.qty_col]
+                    historical_value: tuple[Optional[float], Optional[float]] = (None, None)
+                    has_completed_activity = False
+                    for pair in completed_pairs:
+                        historical_qty = parse_number(row_value(values, pair.qty_col))
+                        historical_amount = parse_number(row_value(values, pair.amt_col))
+                        if historical_qty not in (None, 0) or historical_amount not in (None, 0):
+                            has_completed_activity = True
+                        if (
+                            historical_qty is None
+                            or historical_qty <= 0
+                            or historical_amount is None
+                            or historical_amount <= 0
+                        ):
+                            continue
+                        historical_value = (historical_qty, historical_amount)
+                        break
+
+                    if historical_value == (None, None) and not has_completed_activity:
+                        for pair in estimate_pairs:
+                            historical_qty = parse_number(row_value(values, pair.qty_col))
+                            historical_amount = parse_number(row_value(values, pair.amt_col))
+                            if (
+                                historical_qty is None
+                                or historical_qty <= 0
+                                or historical_amount is None
+                                or historical_amount <= 0
+                            ):
+                                continue
+                            historical_value = (historical_qty, historical_amount)
+                            break
+                    previous_values[(sheet_name, target.qty_col, row_number)] = historical_value
+    finally:
+        values_wb.close()
+
+    return {
+        "sales_codes": sorted(sales_codes, key=normalize_code),
+        "fill_targets": [
+            {
+                "sheet": target.sheet,
+                "month": target.month,
+                "label": target.label,
+                "qty_col": target.qty_col,
+                "amt_col": target.amt_col,
+                "owner_col": target.owner_col,
+                "code_col": target.code_col,
+                "year": target.year,
+            }
+            for target in fill_targets
+        ],
+        "previous_estimate_values": [
+            [sheet, qty_col, row, previous_qty, previous_amount]
+            for (sheet, qty_col, row), (previous_qty, previous_amount) in previous_values.items()
+        ],
+    }
 
 
 def scan_sales_inputs_in_subprocess(
@@ -2348,6 +2553,13 @@ def process_sales_workbooks(
     allow_legacy_overwrite: bool = False,
 ):
     def report_progress(percent: int, step: str, target: Optional[FillTarget] = None) -> None:
+        target_note = ""
+        if target is not None:
+            target_note = f" | {target.sheet} | {target.label}"
+        print(
+            f"[sales-fill] {max(0, min(100, int(percent)))}% {step}{target_note}",
+            flush=True,
+        )
         if progress_callback is None:
             return
         payload = {
