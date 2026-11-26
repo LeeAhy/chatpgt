@@ -1972,6 +1972,75 @@ def preserve_source_workbook_with_forecast_cells(
         patched_path.unlink(missing_ok=True)
 
 
+def prune_generated_workbook_for_patch(
+    sales_wb,
+    written_pairs: Iterable[str],
+) -> None:
+    """Keep only patch cells before serializing the temporary workbook.
+
+    The generated file is never delivered to the user. It only supplies the
+    new cell XML and style table to ``preserve_source_workbook_with_forecast_cells``.
+    Dropping every unrelated cell prevents openpyxl from duplicating a large
+    schedule in memory while saving on Render's 512 MB instance.
+    """
+    coordinates_by_sheet = written_pair_coordinates(written_pairs)
+    original_cell_count = sum(
+        len(getattr(worksheet, "_cells", {}))
+        for worksheet in sales_wb.worksheets
+    )
+    for worksheet in sales_wb.worksheets:
+        keep_coordinates = coordinates_by_sheet.get(worksheet.title, set())
+        cells = getattr(worksheet, "_cells", {})
+        retained_cells = {
+            key: cell
+            for key, cell in cells.items()
+            if cell.coordinate.upper() in keep_coordinates
+        }
+        missing = keep_coordinates - {
+            cell.coordinate.upper() for cell in retained_cells.values()
+        }
+        if missing:
+            raise ValueError(
+                f"临时文件缺少预估单元格：{'、'.join(sorted(missing))}，"
+                "为保护原表已停止保存。"
+            )
+        worksheet._cells = retained_cells
+
+        # These structures are irrelevant to the generated patch file. The
+        # final output inherits every one of them from the untouched source.
+        worksheet.merged_cells.ranges.clear()
+        worksheet.row_dimensions.clear()
+        worksheet.column_dimensions.clear()
+        for attribute in (
+            "_charts",
+            "_images",
+            "_tables",
+            "_pivots",
+            "_hyperlinks",
+        ):
+            collection = getattr(worksheet, attribute, None)
+            if collection is not None:
+                collection.clear()
+        conditional_formatting = getattr(worksheet, "conditional_formatting", None)
+        if conditional_formatting is not None:
+            conditional_formatting._cf_rules.clear()
+        data_validations = getattr(worksheet, "data_validations", None)
+        if data_validations is not None:
+            data_validations.dataValidation.clear()
+        worksheet.auto_filter.ref = None
+        worksheet.freeze_panes = None
+    retained_cell_count = sum(
+        len(getattr(worksheet, "_cells", {}))
+        for worksheet in sales_wb.worksheets
+    )
+    print(
+        "[sales-fill] 保存内存压缩："
+        f"{original_cell_count} -> {retained_cell_count} 个临时单元格",
+        flush=True,
+    )
+    gc.collect()
+
+
 def save_sales_workbook(
     sales_wb,
     output_path: Path,
@@ -2015,6 +2084,7 @@ def save_sales_workbook(
     ) as temp_file:
         generated_path = Path(temp_file.name)
     try:
+        prune_generated_workbook_for_patch(sales_wb, written_pairs)
         sales_wb.save(generated_path)
         release_workbook_memory()
         preserve_source_workbook_with_forecast_cells(
