@@ -71,6 +71,13 @@ try:
     )
 except (TypeError, ValueError):
     SALES_SCAN_TIMEOUT_SECONDS = 600
+try:
+    PREDICTION_SCAN_TIMEOUT_SECONDS = max(
+        180,
+        int(os.environ.get("PREDICTION_SCAN_TIMEOUT_SECONDS", "600")),
+    )
+except (TypeError, ValueError):
+    PREDICTION_SCAN_TIMEOUT_SECONDS = 600
 
 OWNER_PREDICTION_RULES = {
     "洪鸣": {"headers": ("New part NO",), "prefix": False, "unit": "wan"},
@@ -1102,30 +1109,25 @@ def build_predictions_from_workbook(
     current_month: Optional[int] = None,
     unmatched_predictions: Optional[list[dict]] = None,
 ) -> dict[str, dict[int, float]]:
-    wb = load_workbook(pred_path, read_only=False, data_only=True)
+    # Prediction files often contain formatting across thousands of empty
+    # columns. Normal mode materializes those cells and can exhaust Render's
+    # 512 MB worker before matching begins. Read-only mode streams each row and
+    # we retain only rows/columns that contain actual values.
+    wb = load_workbook(pred_path, read_only=True, data_only=True, keep_links=False)
     combined: dict[str, dict[int, float]] = defaultdict(lambda: defaultdict(float))
     sheet_predictions_by_name: list[tuple[str, dict[str, dict[int, float]], list[dict]]] = []
     try:
         for ws in wb.worksheets:
-            # Customer workbooks can contain formatting-only cells thousands
-            # of columns away from the real table. Scanning max_column would
-            # allocate millions of empty cells and exhaust a small web worker.
-            valued_cells = [cell for cell in ws._cells.values() if cell.value not in (None, "")]
-            if not valued_cells:
+            rows = []
+            for values in ws.iter_rows(values_only=True):
+                row = list(values)
+                while row and row[-1] in (None, ""):
+                    row.pop()
+                if any(value not in (None, "") for value in row):
+                    rows.append(row)
+            if not rows:
                 sheet_predictions_by_name.append((ws.title, {}, []))
                 continue
-            max_row = max(cell.row for cell in valued_cells)
-            max_col = max(cell.column for cell in valued_cells)
-            rows = [
-                list(row)
-                for row in ws.iter_rows(
-                    min_row=1,
-                    max_row=max_row,
-                    min_col=1,
-                    max_col=max_col,
-                    values_only=True,
-                )
-            ]
 
             sheet_unmatched: list[dict] = []
             sheet_predictions = build_predictions_from_rows(
@@ -2611,6 +2613,79 @@ def scan_sales_inputs_in_subprocess(
     return sales_codes, fill_targets, previous_estimate_values
 
 
+def parse_predictions_in_subprocess(
+    pred_path: Path,
+    sales_codes: Iterable[str],
+    business_owner: Optional[str],
+    as_of_date: date,
+) -> tuple[dict[str, dict[int, float]], list[dict]]:
+    """Parse an untrusted customer workbook outside the web worker process."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as request_file:
+        request_path = Path(request_file.name)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as result_file:
+        result_path = Path(result_file.name)
+    try:
+        request_path.write_text(
+            json.dumps(
+                {
+                    "sales_codes": sorted(
+                        {clean_text(code) for code in sales_codes if clean_text(code)},
+                        key=normalize_code,
+                    ),
+                    "business_owner": business_owner or "",
+                    "as_of_date": as_of_date.isoformat(),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--scan-predictions",
+            str(pred_path),
+            str(request_path),
+            str(result_path),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=PREDICTION_SCAN_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "读取业务预测文件超过允许时间。网站已停止本次任务以保护数据；"
+                f"当前上限为 {PREDICTION_SCAN_TIMEOUT_SECONDS} 秒。"
+            ) from exc
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "未知错误").strip()[-1500:]
+            raise RuntimeError(f"读取业务预测文件失败：{detail}")
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    finally:
+        request_path.unlink(missing_ok=True)
+        result_path.unlink(missing_ok=True)
+
+    predictions = {
+        clean_text(code): {
+            int(month): float(quantity)
+            for month, quantity in month_map.items()
+            if str(month).isdigit()
+        }
+        for code, month_map in (payload.get("predictions") or {}).items()
+        if clean_text(code) and isinstance(month_map, dict)
+    }
+    unmatched_predictions = [
+        entry
+        for entry in (payload.get("unmatched_predictions") or [])
+        if isinstance(entry, dict)
+    ]
+    return predictions, unmatched_predictions
+
+
 def process_sales_workbooks(
     pred_path: Path | str = PRED_PATH,
     sales_path: Path | str = SALES_PATH,
@@ -2685,13 +2760,11 @@ def process_sales_workbooks(
         )
 
     report_progress(22, "读取业务预测文件")
-    unmatched_predictions: list[dict] = []
-    predictions = build_predictions(
+    predictions, unmatched_predictions = parse_predictions_in_subprocess(
         pred_path,
         sales_codes,
-        business_owner=business_owner,
-        as_of_date=as_of_date,
-        unmatched_predictions=unmatched_predictions,
+        business_owner,
+        as_of_date,
     )
     uploaded_months = prediction_months_with_data(predictions, unmatched_predictions)
     report_progress(32, "匹配预测机种与销售排单客户机种")
@@ -3087,6 +3160,28 @@ def main():
         )
         Path(sys.argv[6] if has_year else sys.argv[5]).write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        return
+    if len(sys.argv) == 5 and sys.argv[1] == "--scan-predictions":
+        request = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+        unmatched_predictions: list[dict] = []
+        predictions = build_predictions(
+            Path(sys.argv[2]),
+            request.get("sales_codes") or [],
+            business_owner=clean_text(request.get("business_owner")) or None,
+            as_of_date=date.fromisoformat(request["as_of_date"]),
+            unmatched_predictions=unmatched_predictions,
+        )
+        Path(sys.argv[4]).write_text(
+            json.dumps(
+                {
+                    "predictions": predictions,
+                    "unmatched_predictions": unmatched_predictions,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
             encoding="utf-8",
         )
         return

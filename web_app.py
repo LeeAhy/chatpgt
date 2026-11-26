@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,7 +42,7 @@ from fill_sales import (
 )
 
 
-HOST = "0.0.0.0"
+HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8000"))
 UPLOAD_MIME = "multipart/form-data"
 XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -69,6 +70,7 @@ LOGIN_COOKIE_NAME = "sales_upload_session"
 LOGIN_SESSION_SECONDS = 12 * 60 * 60
 STATE_LOCK = threading.Lock()
 JOB_LOCK = threading.Lock()
+JOB_EXECUTION_LOCK = threading.Lock()
 HYDRATE_LOCK = threading.Lock()
 JOB_STATUS = {
     "state": "idle",
@@ -312,6 +314,23 @@ def ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def atomic_copy_file(source: Path, destination: Path) -> None:
+    """Copy a file without ever exposing a partially written destination."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".replace",
+    ) as temp_file:
+        temp_path = Path(temp_file.name)
+    try:
+        shutil.copy2(source, temp_path)
+        temp_path.replace(destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def remote_storage_enabled() -> bool:
@@ -3664,20 +3683,43 @@ def process_prediction_job(
                 validate_excel_file(working_sales_path, "当前共用销售排单")
             validate_prediction_file(pred_path, f"{selected_owner} 的预测文件")
 
-            summary = process_sales_workbooks(
-                pred_path=pred_path,
-                sales_path=working_sales_path,
-                output_path=output_path,
-                # The shared weekly schedule can contain hundreds of thousands
-                # of formulas. Freezing them during a web upload makes the
-                # request time out, so the website keeps formulas live.
-                freeze_formulas=False,
-                business_owner=selected_owner,
-                as_of_date=beijing_now().date(),
-                progress_callback=progress_callback,
-                overwrite_pairs=overwrite_pairs,
-                allow_legacy_overwrite=allow_legacy_overwrite,
-            )
+            summary = None
+            last_processing_error: Optional[Exception] = None
+            for processing_attempt in range(1, 3):
+                try:
+                    summary = process_sales_workbooks(
+                        pred_path=pred_path,
+                        sales_path=working_sales_path,
+                        output_path=output_path,
+                        # The shared weekly schedule can contain hundreds of thousands
+                        # of formulas. Freezing them during a web upload makes the
+                        # request time out, so the website keeps formulas live.
+                        freeze_formulas=False,
+                        business_owner=selected_owner,
+                        as_of_date=beijing_now().date(),
+                        progress_callback=progress_callback,
+                        overwrite_pairs=overwrite_pairs,
+                        allow_legacy_overwrite=allow_legacy_overwrite,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_processing_error = exc
+                    if processing_attempt >= 2:
+                        raise
+                    set_job_status(
+                        progress="5",
+                        step="首次处理未完成，正在自动重试",
+                        target="",
+                    )
+                    print(
+                        f"[sales-fill] {selected_owner} 首次处理失败，自动重试：{exc}",
+                        flush=True,
+                    )
+                    time.sleep(1)
+            if summary is None:
+                raise RuntimeError(f"处理业务预测失败：{last_processing_error}")
+
+            validate_excel_file(output_path, "回填结果")
 
             with STATE_LOCK:
                 if not master_sales_exists():
@@ -3685,8 +3727,8 @@ def process_prediction_job(
                 set_job_status(progress="97", step="备份并替换共用销售排单", target="")
                 backup_name = beijing_now().strftime("%Y%m%d_%H%M%S") + f"_{selected_owner}_before.xlsx"
                 shutil.copy2(MASTER_SALES_PATH, BACKUP_DIR / backup_name)
-                shutil.copy2(output_path, MASTER_SALES_PATH)
-                shutil.copy2(output_path, LATEST_OUTPUT_PATH)
+                atomic_copy_file(output_path, MASTER_SALES_PATH)
+                atomic_copy_file(output_path, LATEST_OUTPUT_PATH)
                 set_job_status(progress="98", step="同步保存共享网站数据", target="")
                 try:
                     sync_master_files_to_remote()
@@ -3755,13 +3797,16 @@ def process_prediction_job(
             target="",
         )
     except Exception as exc:  # noqa: BLE001
+        failed_step = str(get_job_status().get("step") or "未知阶段")
+        error_message = f"失败阶段：{failed_step}；{exc}"
+        traceback.print_exc()
         set_job_status(
             state="error",
             owner=selected_owner,
             message="处理失败",
             finished_at=now_label(),
             updated_rows="",
-            error=str(exc),
+            error=error_message,
             progress=format_progress(get_job_status().get("progress")),
             step="处理失败",
         )
@@ -3771,8 +3816,11 @@ def process_prediction_job(
             updated_rows="",
             progress=format_progress(get_job_status().get("progress")),
             updated_at=now_label(),
-            error=str(exc),
+            error=error_message,
         )
+    finally:
+        if JOB_EXECUTION_LOCK.locked():
+            JOB_EXECUTION_LOCK.release()
 
 
 def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None:
@@ -3786,6 +3834,7 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         return
 
     selected_owner = DEFAULT_OWNER
+    job_slot_acquired = False
     try:
         form = cgi.FieldStorage(
             fp=handler.rfile,
@@ -3806,8 +3855,9 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             raise ValueError("预测信息请上传 .xlsx、.jpg 或 .png 文件。")
         if not master_sales_exists():
             raise ValueError("请先在页面上方上传本周共用销售排单。")
-        if job_is_running():
+        if not JOB_EXECUTION_LOCK.acquire(blocking=False):
             raise ValueError("上一份预测还在处理，请稍后刷新页面，完成后再上传下一位业务预测。")
+        job_slot_acquired = True
 
         overwrite_pairs, allow_legacy_overwrite = owner_overwrite_context(selected_owner)
 
@@ -3857,6 +3907,8 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
             daemon=True,
         )
         worker.start()
+        # The worker owns and releases the execution slot from this point.
+        job_slot_acquired = False
 
         write_html(
             handler,
@@ -3870,6 +3922,8 @@ def handle_generate(handler: BaseHTTPRequestHandler, head: bool = False) -> None
         )
         return
     except Exception as exc:  # noqa: BLE001
+        if job_slot_acquired and JOB_EXECUTION_LOCK.locked():
+            JOB_EXECUTION_LOCK.release()
         write_html(
             handler,
             400,
